@@ -290,6 +290,7 @@ server {
     location = /speed { default_type text/html; charset utf-8; try_files /speed.html =404; }
     location = /down  { add_header Cache-Control "no-store" always; try_files /down.bin =404; }
     location = /up    { client_max_body_size 0; client_body_buffer_size 1m; add_header Cache-Control "no-store" always; return 204; }
+    location = /up1   { client_max_body_size 0; client_body_buffer_size 1m; keepalive_requests 1; add_header Cache-Control "no-store" always; return 204; }
     location = /log   { access_log $logdir/speed.log lastvn_speed; add_header Cache-Control "no-store" always; return 204; }
 
     # Логи: только по секретному пути (токен первого пользователя), без листинга.
@@ -330,7 +331,8 @@ button:disabled{opacity:.5}small{color:#777;text-align:center;max-width:420px}
 </style></head><body>
 <img src="/logo.png" alt=""><h2>Скорость до сервера LastVN</h2>
 <small>Выключи VPN перед тестом — так видно, режет ли провайдер канал до этого сервера.</small>
-<div class="row"><div>Скачивание<div class="v" id="d">—</div>Мбит/с</div><div>Выгрузка<div class="v" id="u">—</div>Мбит/с</div></div>
+<div class="row"><div>Скачивание<div class="v" id="d">—</div>Мбит/с</div><div>Выгрузка<div class="v" id="u">—</div>Мбит/с</div><div>Выгрузка*<div class="v" id="f">—</div>Мбит/с</div></div>
+<small>* каждый кусок по 1 МБ — новым соединением</small><br>
 <button id="b">Начать</button>
 <small id="s"></small>
 <script>
@@ -343,18 +345,22 @@ async function down(){
       if(performance.now()-t0>T){stop=true;rd.cancel();break}}}};
   await Promise.all(Array.from({length:P},one)); return mbps(bytes,performance.now()-t0);
 }
-async function up(){
+async function up(path='/up', mb=8, out='u'){
   const chunk=new Uint8Array(1<<20); for(let i=0;i<chunk.length;i+=65536)crypto.getRandomValues(chunk.subarray(i,i+65536));
-  const blob=new Blob(Array(8).fill(chunk)); // 8 МБ на запрос
+  const blob=new Blob(Array(mb).fill(chunk));
   let bytes=0, t0=performance.now();
-  const one=async()=>{while(performance.now()-t0<T){await fetch('/up?'+Math.random(),{method:'POST',body:blob,cache:'no-store'});
-    bytes+=blob.size;$('u').textContent=mbps(bytes,performance.now()-t0)}};
+  const one=async()=>{while(performance.now()-t0<T){await fetch(path+'?'+Math.random(),{method:'POST',body:blob,cache:'no-store'});
+    bytes+=blob.size;$(out).textContent=mbps(bytes,performance.now()-t0)}};
   await Promise.all(Array.from({length:P},one)); return mbps(bytes,performance.now()-t0);
 }
-$('b').onclick=async()=>{$('b').disabled=true;$('d').textContent=$('u').textContent='…';
+$('b').onclick=async()=>{$('b').disabled=true;$('d').textContent=$('u').textContent=$('f').textContent='…';
   try{$('s').textContent='Скачивание…';$('d').textContent=await down();
-      $('s').textContent='Выгрузка…';$('u').textContent=await up();$('s').textContent='Готово — результат записан в лог';
-      fetch('/log?d='+$('d').textContent+'&u='+$('u').textContent+'&n=direct',{cache:'no-store'});}
+      $('s').textContent='Выгрузка…';$('u').textContent=await up();
+      fetch('/log?d='+$('d').textContent+'&u='+$('u').textContent+'&n=direct-keepalive',{cache:'no-store'});
+      await new Promise(r=>setTimeout(r,3000));
+      $('s').textContent='Выгрузка новыми соединениями…';$('f').textContent=await up('/up1',1,'f');
+      fetch('/log?d=-&u='+$('f').textContent+'&n=direct-fresh-conn',{cache:'no-store'});
+      $('s').textContent='Готово — результат записан в лог';}
   catch(e){$('s').textContent='Ошибка: '+e}
   $('b').disabled=false};
 </script></body></html>
