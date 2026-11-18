@@ -187,12 +187,15 @@ write_config() {
       ]
     }
   }' > "$CONFIG"
-  if [[ -n ${LAB_PORT:-} ]]; then
+  local lab_spec lab_tag lab_port lab_sni
+  for lab_spec in "lab:${LAB_PORT:-}:${LAB_SNI:-}" "lab2:${LAB2_PORT:-}:${LAB2_SNI:-}"; do
+    IFS=: read -r lab_tag lab_port lab_sni <<<"$lab_spec"
+    [[ -n $lab_port ]] || continue
     local tmp; tmp=$(mktemp)
-    jq --argjson lp "$LAB_PORT" --arg ls "${LAB_SNI:-}" '.inbounds += [.inbounds[0] | .tag = "lab" | .port = $lp
+    jq --arg tag "$lab_tag" --argjson lp "$lab_port" --arg ls "$lab_sni" '.inbounds += [.inbounds[0] | .tag = $tag | .port = $lp
         | if $ls != "" then .streamSettings.realitySettings.target = ($ls + ":443")
                            | .streamSettings.realitySettings.serverNames = [$ls] else . end]' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
-  fi
+  done
   chmod 644 "$CONFIG"
 }
 
@@ -639,9 +642,11 @@ cmd_upgrade() {
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
   [[ -n $priv && $priv != null && -n $path && $path != null ]] || die "не удалось прочитать текущий конфиг"
-  local LAB_PORT LAB_SNI
+  local LAB_PORT LAB_SNI LAB2_PORT LAB2_SNI
   LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
+  LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
+  LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -772,9 +777,11 @@ cmd_selfsteal() {
   path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
-  local LAB_PORT LAB_SNI
+  local LAB_PORT LAB_SNI LAB2_PORT LAB2_SNI
   LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
+  LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
+  LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -835,11 +842,11 @@ cmd_monitor_loop() {
     cpu=$(( total > ptotal ? 100 - 100 * (idle - pidle) / (total - ptotal) : 0 ))
     prx=$rx; ptx=$tx; pidle=$idle; ptotal=$total
     if (( drx >= 2 || dtx >= 2 )); then
-      local lp; lp=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+      local lp lp2; lp=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true); lp2=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
       printf '%s rx(от клиентов)=%sMbit tx(к клиентам)=%sMbit cpu=%s%% conn443=%s%s\n' \
         "$(date '+%F %T')" "$drx" "$dtx" "$cpu" \
         "$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)" \
-        "${lp:+ conn$lp=$(ss -Htn state established "( sport = :$lp )" 2>/dev/null | wc -l)}" >> "$dir/net.log"
+        "${lp:+ conn$lp=$(ss -Htn state established "( sport = :$lp )" 2>/dev/null | wc -l)}${lp2:+ conn$lp2=$(ss -Htn state established "( sport = :$lp2 )" 2>/dev/null | wc -l)}" >> "$dir/net.log"
     fi
     if (( n++ % 60 == 0 )); then
       write_status "$dir" > "$dir/status.txt.tmp" 2>&1 && mv "$dir/status.txt.tmp" "$dir/status.txt"
@@ -904,20 +911,24 @@ cmd_logs() {
 }
 
 # Лаборатория: копия VPN-входа на втором порту, чтобы сравнивать по логам (порт/режим).
-cmd_lab() {
+cmd_lab() { lab_generic LAB "$@"; }
+cmd_lab2() { lab_generic LAB2 "$@"; }
+
+lab_generic() {
   need_root; need_installed
+  local V=$1; shift
   local arg=${1:-on} lsni=""
   [[ ${2:-} == --sni ]] && lsni=${3:-}
   [[ $arg == --sni ]] && { lsni=${2:-}; arg=on; }
-  sed -i '/^LAB_PORT=/d; /^LAB_SNI=/d' "$STATE"
+  sed -i "/^${V}_PORT=/d; /^${V}_SNI=/d" "$STATE"
   if [[ $arg == off ]]; then
     green "Лаборатория выключена"
   else
-    local lp=2083; [[ $arg =~ ^[0-9]+$ ]] && lp=$arg
+    local lp=2083; [[ $V == LAB2 ]] && lp=2087; [[ $arg =~ ^[0-9]+$ ]] && lp=$arg
     port_free "$lp"
-    echo "LAB_PORT=$lp" >> "$STATE"
+    echo "${V}_PORT=$lp" >> "$STATE"
     if [[ -n $lsni ]]; then
-      echo "LAB_SNI=$lsni" >> "$STATE"
+      echo "${V}_SNI=$lsni" >> "$STATE"
       check_sni "$lsni"
     fi
     open_port "$lp"
@@ -1099,6 +1110,7 @@ case ${1:-} in
   status)    cmd_status ;;
   tune)      cmd_tune ;;
   lab)       shift; cmd_lab "$@" ;;
+  lab2)      shift; cmd_lab2 "$@" ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
