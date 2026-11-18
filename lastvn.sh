@@ -95,12 +95,14 @@ server_ip() {
 
 # Совместимо со всеми форматами xray x25519: "Private key/Public key", "PrivateKey/Password", "PrivateKey/Password (PublicKey)".
 gen_keys() {
+  # Во всех версиях xray x25519 первая строка — приватный ключ, вторая — публичный
+  # ("Public key" / "Password" / "Password (PublicKey)"). Берём значение после последнего ": ".
   local out priv pub
-  out=$("$XRAY_BIN" x25519)
-  # Ключ поля нормализуем: "Password (PublicKey)" -> "passwordpublickey", "Private key" -> "privatekey".
-  priv=$(awk -F': *' '{k=tolower($1); gsub(/[^a-z0-9]/,"",k)} k=="privatekey" {print $2}' <<<"$out")
-  pub=$(awk -F': *' '{k=tolower($1); gsub(/[^a-z0-9]/,"",k)} k=="publickey"||k=="password"||k=="passwordpublickey" {print $2}' <<<"$out")
-  [[ -n $priv && -n $pub ]] || die "не удалось распарсить вывод xray x25519: $out"
+  out=$("$XRAY_BIN" x25519 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')
+  priv=$(sed -n '1s/.*:[[:space:]]*//p' <<<"$out")
+  pub=$(sed -n '2s/.*:[[:space:]]*//p' <<<"$out")
+  [[ $priv =~ ^[A-Za-z0-9_-]{43}$ && $pub =~ ^[A-Za-z0-9_-]{43}$ ]] \
+    || die "не удалось распарсить вывод xray x25519: $out"
   echo "$priv $pub"
 }
 
