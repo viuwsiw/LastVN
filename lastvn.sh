@@ -11,7 +11,7 @@
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
-#   sudo bash lastvn.sh mtproto [--port 8443] [--domain www.google.com] — прокси для Telegram
+#   sudo bash lastvn.sh mtproto [--port 8443] [--domain IP.sslip.io] — прокси для Telegram
 #   sudo bash lastvn.sh mtproto-remove   — удалить прокси для Telegram
 #   sudo bash lastvn.sh uninstall        — удалить всё
 
@@ -457,7 +457,7 @@ mtg_link() {
   local secret port ip
   secret=$(sed -n 's/^secret *= *"\(.*\)"/\1/p' "$MTG_CONF")
   port=$(sed -n 's/^bind-to *= *".*:\([0-9]*\)"/\1/p' "$MTG_CONF")
-  ip=$(sed -n 's/^SERVER_IP=//p' "$STATE" 2>/dev/null)
+  ip=$(sed -n 's/^SERVER_IP=//p' "$STATE" 2>/dev/null || true)
   [[ -n $ip ]] || ip=$(server_ip)
   echo "https://t.me/proxy?server=$ip&port=$port&secret=$secret"
 }
@@ -472,7 +472,10 @@ show_mtg() {
 
 cmd_mtproto() {
   need_root
-  local port=8443 domain="www.google.com"
+  # Домен маскировки должен указывать на IP этого сервера (иначе DPI видит
+  # несоответствие SNI и IP и режет соединение). Без своего домена берём sslip.io:
+  # 1-2-3-4.sslip.io всегда резолвится в 1.2.3.4.
+  local port=8443 domain=""
   while [[ $# -gt 0 ]]; do
     case $1 in
       --port)   port=$2;   shift 2 ;;
@@ -487,6 +490,11 @@ cmd_mtproto() {
   fi
   valid_port "$port" || die "неверный порт: $port"
   command -v jq >/dev/null || install_deps
+  if [[ -z $domain ]]; then
+    local ip; ip=$(sed -n 's/^SERVER_IP=//p' "$STATE" 2>/dev/null || true)
+    [[ -n $ip ]] || ip=$(server_ip)
+    domain="${ip//./-}.sslip.io"
+  fi
   port_free "$port"
 
   yellow "Устанавливаю mtg (MTProto-прокси)..."

@@ -70,9 +70,9 @@ sudo bash lastvn.sh install --port 443 --sub-port 2096 --sni www.microsoft.com -
 sudo bash lastvn.sh mtproto
 ```
 
-Ставит [mtg](https://github.com/9seconds/mtg) в режиме FakeTLS: для DPI трафик выглядит как HTTPS к `www.google.com`. По умолчанию работает на порту `8443` (443 занят VPN). Выводит ссылку `https://t.me/proxy?...`: открой её на устройстве с Telegram, и прокси добавится в один клик.
+Ставит [mtg](https://github.com/9seconds/mtg) в режиме FakeTLS: для DPI трафик выглядит как HTTPS к домену `IP-сервера.sslip.io`, который указывает на этот же сервер (SNI и IP совпадают, DPI не к чему придраться). По умолчанию работает на порту `8443` (443 занят VPN). Выводит ссылку `https://t.me/proxy?...`: открой её на устройстве с Telegram, и прокси добавится в один клик.
 
-Параметры: `--port 8443 --domain www.google.com`.
+Параметры: `--port 8443 --domain свой.домен` (домен должен указывать на IP сервера).
 
 ## Клиенты (с поддержкой XHTTP)
 
