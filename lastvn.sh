@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LastVN — установщик VLESS + XHTTP + Reality на базе Xray-core.
+# LastVN — установщик VLESS + Reality (Vision + XHTTP на одном порту) на базе Xray-core.
 # Домен и сертификат не нужны: Reality маскирует трафик под TLS чужого сайта.
 #
 # Использование:
@@ -10,6 +10,7 @@
 #   sudo bash lastvn.sh link <имя>       — подписка, ссылка и QR-код для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
+#   sudo bash lastvn.sh upgrade          — обновить установку (добавить быстрый Vision)
 #   sudo bash lastvn.sh mtproto [--port 8443] [--domain www.google.com] — прокси для Telegram
 #   sudo bash lastvn.sh mtproto-remove   — удалить прокси для Telegram
 #   sudo bash lastvn.sh uninstall        — удалить всё
@@ -137,44 +138,69 @@ check_sni() {
 }
 
 # ---------- конфиг Xray ----------
+# Схема: внешний порт (443) — VLESS + TCP + Reality + Vision (самый быстрый режим, splice в ядре).
+# Всё, что не Vision (XHTTP-клиенты), после расшифровки Reality уходит fallback'ом
+# во внутренний XHTTP-инбаунд на abstract unix-сокете. Обе ссылки работают на одном порту.
+XHTTP_SOCK="@lastvn-xhttp"
+
 write_config() {
-  local port=$1 sni=$2 priv=$3 sid=$4 path=$5 uuid=$6 name=$7
+  local port=$1 sni=$2 priv=$3 sid=$4 path=$5 clients=$6
   mkdir -p "$XRAY_DIR"
   jq -n \
-    --argjson port "$port" --arg sni "$sni" --arg priv "$priv" \
-    --arg sid "$sid" --arg path "$path" --arg uuid "$uuid" --arg name "$name" '
+    --argjson port "$port" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" \
+    --arg path "$path" --arg sock "$XHTTP_SOCK" --argjson clients "$clients" '
   {
     log: { loglevel: "warning" },
-    inbounds: [{
-      tag: "vless-xhttp-reality",
-      listen: "0.0.0.0",
-      port: $port,
-      protocol: "vless",
-      settings: {
-        clients: [{ id: $uuid, email: $name }],
-        decryption: "none"
+    inbounds: [
+      {
+        tag: "vless-vision-reality",
+        listen: "0.0.0.0",
+        port: $port,
+        protocol: "vless",
+        settings: {
+          clients: [ $clients[] | { id, email, flow: "xtls-rprx-vision" } ],
+          decryption: "none",
+          fallbacks: [ { dest: $sock } ]
+        },
+        streamSettings: {
+          network: "raw",
+          security: "reality",
+          realitySettings: {
+            show: false,
+            target: ($sni + ":443"),
+            xver: 0,
+            serverNames: [$sni],
+            privateKey: $priv,
+            shortIds: [$sid]
+          },
+          sockopt: { tcpFastOpen: true, tcpNoDelay: true }
+        },
+        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
       },
-      streamSettings: {
-        network: "xhttp",
-        xhttpSettings: { path: $path, mode: "auto" },
-        security: "reality",
-        realitySettings: {
-          show: false,
-          target: ($sni + ":443"),
-          xver: 0,
-          serverNames: [$sni],
-          privateKey: $priv,
-          shortIds: [$sid]
-        }
-      },
-      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
-    }],
+      {
+        tag: "vless-xhttp",
+        listen: $sock,
+        protocol: "vless",
+        settings: {
+          clients: [ $clients[] | { id, email } ],
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "xhttp",
+          xhttpSettings: { path: $path, mode: "auto" }
+        },
+        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
+      }
+    ],
     outbounds: [
-      { tag: "direct", protocol: "freedom" },
+      { tag: "direct", protocol: "freedom", streamSettings: { sockopt: { tcpFastOpen: true, tcpNoDelay: true } } },
       { tag: "block",  protocol: "blackhole" }
     ],
+    policy: {
+      levels: { "0": { handshake: 4, connIdle: 300, uplinkOnly: 1, downlinkOnly: 1 } }
+    },
     routing: {
-      domainStrategy: "IPIfNonMatch",
+      domainStrategy: "AsIs",
       rules: [
         { type: "field", ip: ["geoip:private"], outboundTag: "block" },
         { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
@@ -182,6 +208,11 @@ write_config() {
     }
   }' > "$CONFIG"
   chmod 644 "$CONFIG"
+}
+
+# Пользователи из текущего конфига: [{id, email}] (работает и со старой схемой «только XHTTP»).
+config_clients() {
+  jq -c '[.inbounds[0].settings.clients[] | {id, email}]' "$CONFIG"
 }
 
 test_and_restart() {
@@ -199,20 +230,30 @@ edit_config() {
 }
 
 user_uuid() {
-  jq -r --arg n "$1" '.inbounds[0].settings.clients[] | select(.email==$n) | .id' "$CONFIG"
+  jq -r --arg n "$1" '[.inbounds[].settings.clients[]? | select(.email==$n) | .id][0] // empty' "$CONFIG"
 }
 
 # ---------- ссылки и подписка ----------
 urlencode() { jq -rn --arg s "$1" '$s|@uri'; }
 
+# make_link <имя> vision|xhttp
 make_link() {
-  local uuid; uuid=$(user_uuid "$1")
-  [[ -n $uuid ]] || die "пользователь '$1' не найден"
+  local name=$1 kind=${2:-vision} uuid
+  uuid=$(user_uuid "$name")
+  [[ -n $uuid ]] || die "пользователь '$name' не найден"
   # shellcheck disable=SC1090
   source "$STATE"
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$(urlencode "$XHTTP_PATH")" "$(urlencode "$TITLE")"
+  local common="encryption=none&security=reality&sni=$SNI&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID"
+  if [[ $kind == vision ]]; then
+    printf 'vless://%s@%s:%s?%s&flow=xtls-rprx-vision&type=tcp&headerType=none#%s\n' \
+      "$uuid" "$SERVER_IP" "$PORT" "$common" "$(urlencode "LastVN ⚡ Быстрый")"
+  else
+    printf 'vless://%s@%s:%s?%s&type=xhttp&path=%s&mode=auto#%s\n' \
+      "$uuid" "$SERVER_IP" "$PORT" "$common" "$(urlencode "$XHTTP_PATH")" "$(urlencode "LastVN · Запасной")"
+  fi
 }
+
+make_links() { make_link "$1" vision; make_link "$1" xhttp; }
 
 user_token() { awk -v n="$1" '$1==n {print $2}' "$TOKENS" 2>/dev/null; }
 
@@ -229,7 +270,7 @@ rebuild_subs() {
   local name token
   while read -r name token; do
     [[ -n $name ]] || continue
-    make_link "$name" | base64 -w0 > "$WEB/sub/$token"
+    make_links "$name" | base64 -w0 > "$WEB/sub/$token"
   done < "$TOKENS"
   chmod -R a+rX "$WEB"
 }
@@ -285,24 +326,34 @@ EOF
   systemctl restart nginx
 }
 
+# Компактный QR: минимальная рамка и коррекция ошибок L (меньше модулей).
+# В консоли VNC/tty (TERM=linux) блоки UTF-8 не рисуются — там цветные пробелы.
+qr() {
+  command -v qrencode >/dev/null || return 0
+  if [[ ${TERM:-} == linux ]]; then
+    qrencode -t ANSI -m 1 -l L "$1"
+  else
+    qrencode -t UTF8 -m 1 -l L "$1"
+  fi
+}
+
 show_user() {
-  local name=$1 sub link
+  local name=$1 sub
   sub=$(sub_url "$name")
-  link=$(make_link "$name")
   echo
   green "Пользователь: $name"
   echo
-  echo "Подписка (для Happ / INCY — с названием и логотипом LastVN):"
+  echo "Подписка (Happ / INCY — название LastVN, оба сервера сразу):"
   echo "  $sub"
   echo
-  echo "Прямая ссылка:"
-  echo "  $link"
+  echo "⚡ Быстрый (Vision):"
+  echo "  $(make_link "$name" vision)"
   echo
-  if command -v qrencode >/dev/null; then
-    echo "QR подписки:"
-    # Консоль VNC/tty (TERM=linux) не рисует блоки UTF-8 — там используем цветные пробелы.
-    if [[ ${TERM:-} == linux ]]; then qrencode -t ANSI "$sub"; else qrencode -t ANSIUTF8 "$sub"; fi
-  fi
+  echo "Запасной (XHTTP):"
+  echo "  $(make_link "$name" xhttp)"
+  echo
+  echo "QR подписки:"
+  qr "$sub"
 }
 
 # ---------- команды ----------
@@ -339,7 +390,8 @@ cmd_install() {
   uuid=$("$XRAY_BIN" uuid)
   check_sni "$sni"
 
-  write_config "$port" "$sni" "$priv" "$sid" "$path" "$uuid" "$name"
+  write_config "$port" "$sni" "$priv" "$sid" "$path" \
+    "$(jq -nc --arg id "$uuid" --arg n "$name" '[{id:$id, email:$n}]')"
   cat > "$STATE" <<EOF
 SERVER_IP=$ip
 PORT=$port
@@ -360,7 +412,7 @@ EOF
   write_web "$ip" "$sub_port" "$support"
   rebuild_subs
 
-  green "Готово! VLESS + XHTTP + Reality работает на $ip:$port (маскировка под $sni)"
+  green "Готово! VLESS + Reality (Vision и XHTTP) работает на $ip:$port (маскировка под $sni)"
   show_user "$name"
 }
 
@@ -370,7 +422,11 @@ cmd_add() {
   [[ $name =~ ^[A-Za-z0-9_.-]+$ ]] || die "имя: только латиница, цифры, _ . -"
   [[ -z $(user_uuid "$name") ]] || die "пользователь '$name' уже есть"
   local uuid; uuid=$("$XRAY_BIN" uuid)
-  edit_config --arg n "$name" --arg id "$uuid" '.inbounds[0].settings.clients += [{id:$id, email:$n}]'
+  edit_config --arg n "$name" --arg id "$uuid" '
+    .inbounds |= map(
+      if .tag == "vless-vision-reality" then .settings.clients += [{id:$id, email:$n, flow:"xtls-rprx-vision"}]
+      elif .settings.clients then .settings.clients += [{id:$id, email:$n}]
+      else . end)'
   test_and_restart
   add_token "$name"
   rebuild_subs
@@ -382,7 +438,8 @@ cmd_del() {
   local name=${1:-}; [[ -n $name ]] || die "укажи имя: $0 del <имя>"
   [[ -n $(user_uuid "$name") ]] || die "пользователь '$name' не найден"
   [[ $(jq '.inbounds[0].settings.clients | length' "$CONFIG") -gt 1 ]] || die "нельзя удалить последнего пользователя"
-  edit_config --arg n "$name" '.inbounds[0].settings.clients |= map(select(.email != $n))'
+  edit_config --arg n "$name" '
+    .inbounds |= map(if .settings.clients then .settings.clients |= map(select(.email != $n)) else . end)'
   test_and_restart
   local tmp; tmp=$(mktemp)
   awk -v n="$name" '$1!=n' "$TOKENS" > "$tmp" && mv "$tmp" "$TOKENS" && chmod 600 "$TOKENS"
@@ -461,7 +518,7 @@ show_mtg() {
   echo "  $link"
   echo
   if command -v qrencode >/dev/null; then
-    if [[ ${TERM:-} == linux ]]; then qrencode -t ANSI "$link"; else qrencode -t ANSIUTF8 "$link"; fi
+    qr "$link"
   fi
 }
 
@@ -531,6 +588,31 @@ cmd_mtproto_remove() {
   green "MTProto-прокси удалён"
 }
 
+cmd_upgrade() {
+  need_root; need_installed
+  local r priv sid sni path port clients
+  r=$(jq -c '[.inbounds[] | .streamSettings.realitySettings? // empty][0]' "$CONFIG")
+  priv=$(jq -r '.privateKey' <<<"$r")
+  sid=$(jq -r '.shortIds[0]' <<<"$r")
+  sni=$(jq -r '.serverNames[0]' <<<"$r")
+  path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
+  port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
+  clients=$(config_clients)
+  [[ -n $priv && $priv != null && -n $path && $path != null ]] || die "не удалось прочитать текущий конфиг"
+  cp "$CONFIG" "$CONFIG.bak"
+  write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients"
+  if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
+    cp "$CONFIG.bak" "$CONFIG"
+    die "новый конфиг не прошёл проверку, вернул старый ($CONFIG.bak)"
+  fi
+  tune_network
+  test_and_restart
+  rebuild_subs
+  green "Обновлено: добавлен быстрый режим Vision. Старые ссылки и подписки продолжают работать."
+  local name
+  for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -549,7 +631,7 @@ cmd_uninstall() {
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -700,6 +782,7 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  upgrade)   cmd_upgrade ;;
   mtproto)   shift; cmd_mtproto "$@" ;;
   mtproto-remove) cmd_mtproto_remove ;;
   uninstall) cmd_uninstall ;;
