@@ -10,6 +10,7 @@
 #   sudo bash lastvn.sh link <имя>       — подписка и ключ для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
+#   sudo bash lastvn.sh selfsteal [домен] — маскировка под свой сайт (против шейпинга DPI)
 #   sudo bash lastvn.sh speed            — проверить канал сервера и нагрузку CPU
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
 #   sudo bash lastvn.sh mtproto [--port 8443] [--domain IP.sslip.io] — прокси для Telegram
@@ -141,11 +142,11 @@ check_sni() {
 # ---------- конфиг Xray ----------
 # Канал VPN: VLESS + XHTTP + Reality на внешнем порту (443).
 write_config() {
-  local port=$1 sni=$2 priv=$3 sid=$4 path=$5 clients=$6
+  local port=$1 sni=$2 priv=$3 sid=$4 path=$5 clients=$6 target=${7:-"$2:443"}
   mkdir -p "$XRAY_DIR"
   jq -n \
     --argjson port "$port" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" \
-    --arg path "$path" --argjson clients "$clients" '
+    --arg path "$path" --argjson clients "$clients" --arg target "$target" '
   {
     log: { loglevel: "warning" },
     inbounds: [{
@@ -164,7 +165,7 @@ write_config() {
         security: "reality",
         realitySettings: {
           show: false,
-          target: ($sni + ":443"),
+          target: $target,
           xver: 0,
           serverNames: [$sni],
           privateKey: $priv,
@@ -552,17 +553,18 @@ cmd_mtproto_remove() {
 
 cmd_upgrade() {
   need_root; need_installed
-  local r priv sid sni path port clients
+  local r priv sid sni path port clients target
   r=$(jq -c '[.inbounds[] | .streamSettings.realitySettings? // empty][0]' "$CONFIG")
   priv=$(jq -r '.privateKey' <<<"$r")
   sid=$(jq -r '.shortIds[0]' <<<"$r")
   sni=$(jq -r '.serverNames[0]' <<<"$r")
+  target=$(jq -r '.target // .dest' <<<"$r")
   path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
   [[ -n $priv && $priv != null && -n $path && $path != null ]] || die "не удалось прочитать текущий конфиг"
   cp "$CONFIG" "$CONFIG.bak"
-  write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients"
+  write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
     cp "$CONFIG.bak" "$CONFIG"
     die "новый конфиг не прошёл проверку, вернул старый ($CONFIG.bak)"
@@ -597,6 +599,107 @@ cmd_speed() {
   ps -eo comm,%cpu,rss --sort=-%cpu | awk 'NR==1 || /xray|mtg|nginx/' | head -6
 }
 
+# ---------- Reality self-steal: маскировка под собственный сайт на этом же IP ----------
+# DPI сверяет SNI с IP: «www.microsoft.com» на чужом IP = подозрительно, такие соединения шейпят.
+# Здесь SNI = домен, который указывает на этот сервер (IP.sslip.io), а за ним — настоящий
+# HTTPS-сайт (nginx на 127.0.0.1:9443). Reality «одалживает» TLS-рукопожатие у него.
+SELFSTEAL_PORT=9443
+SELFSTEAL_CONF="/etc/nginx/conf.d/lastvn-selfsteal.conf"
+CERT_DIR="/etc/lastvn/cert"
+
+get_cert() {
+  local domain=$1
+  mkdir -p "$CERT_DIR" /var/www/lastvn-acme
+  # Порт 80: ACME-проверка Let's Encrypt + редирект на https.
+  cat > /etc/nginx/conf.d/lastvn-http.conf <<NGX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    server_tokens off;
+    location /.well-known/acme-challenge/ { root /var/www/lastvn-acme; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+NGX
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx
+  open_port 80
+
+  if ! command -v certbot >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot >/dev/null 2>&1 || true
+  fi
+  if command -v certbot >/dev/null && certbot certonly --webroot -w /var/www/lastvn-acme -d "$domain" \
+       --agree-tos --register-unsafely-without-email -n --quiet \
+       --deploy-hook "systemctl reload nginx" >/dev/null 2>&1; then
+    ln -sf "/etc/letsencrypt/live/$domain/fullchain.pem" "$CERT_DIR/fullchain.pem"
+    ln -sf "/etc/letsencrypt/live/$domain/privkey.pem"   "$CERT_DIR/privkey.pem"
+    green "Сертификат Let's Encrypt для $domain получен"
+  else
+    yellow "Let's Encrypt не выдал сертификат — ставлю самоподписанный (для обхода шейпера этого достаточно)."
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+      -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" \
+      -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" >/dev/null 2>&1
+  fi
+}
+
+write_selfsteal_site() {
+  local domain=$1
+  cat > "$SELFSTEAL_CONF" <<NGX
+# LastVN: сайт-маска для Reality (доступен только локально, снаружи — через Xray на 443)
+server {
+    listen 127.0.0.1:$SELFSTEAL_PORT ssl;
+    http2 on;
+    server_name $domain;
+    server_tokens off;
+    ssl_certificate     $CERT_DIR/fullchain.pem;
+    ssl_certificate_key $CERT_DIR/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:lastvn:10m;
+    root $WEB;
+    location = / { try_files /index.html =404; }
+    location = /logo.png { }
+    location / { return 404; }
+}
+NGX
+  nginx -t >/dev/null 2>&1 || die "конфиг nginx невалиден: nginx -t"
+  systemctl reload nginx
+}
+
+cmd_selfsteal() {
+  need_root; need_installed
+  local domain=${1:-}
+  # shellcheck disable=SC1090
+  source "$STATE"
+  [[ -n $domain ]] || domain="${SERVER_IP//./-}.sslip.io"
+  local who; who=$(ss -Hltnp 'sport = :80' 2>/dev/null || true)
+  [[ -z $who || $who == *nginx* ]] || die "порт 80 занят: $who"
+
+  yellow "Настраиваю маскировку под $domain (self-steal)..."
+  get_cert "$domain"
+  write_selfsteal_site "$domain"
+
+  local r priv sid path port clients
+  r=$(jq -c '[.inbounds[] | .streamSettings.realitySettings? // empty][0]' "$CONFIG")
+  priv=$(jq -r '.privateKey' <<<"$r")
+  sid=$(jq -r '.shortIds[0]' <<<"$r")
+  path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
+  port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
+  clients=$(config_clients)
+  cp "$CONFIG" "$CONFIG.bak"
+  write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
+  if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
+    cp "$CONFIG.bak" "$CONFIG"
+    die "новый конфиг не прошёл проверку, вернул старый"
+  fi
+  sed -i "s/^SNI=.*/SNI=$domain/" "$STATE"
+  test_and_restart
+  rebuild_subs
+  green "Готово: VPN маскируется под $domain (SNI совпадает с IP сервера)."
+  yellow "В Happ обнови подписку — в ключе поменялся SNI."
+  local name
+  for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -610,12 +713,12 @@ cmd_uninstall() {
   [[ $ans =~ ^[Yy]$ ]] || exit 0
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
   if [[ -f $MTG_CONF ]]; then cmd_mtproto_remove; fi
-  rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" /etc/sysctl.d/99-lastvn.conf /etc/sysctl.d/99-lastvn-bbr.conf /etc/systemd/system/xray.service.d/99-lastvn.conf
+  rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" "$SELFSTEAL_CONF" /etc/nginx/conf.d/lastvn-http.conf /etc/lastvn /etc/sysctl.d/99-lastvn.conf /etc/sysctl.d/99-lastvn-bbr.conf /etc/systemd/system/xray.service.d/99-lastvn.conf
   systemctl reload nginx 2>/dev/null || true
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -766,6 +869,7 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  selfsteal) shift; cmd_selfsteal "$@" ;;
   speed)     cmd_speed ;;
   upgrade)   cmd_upgrade ;;
   mtproto)   shift; cmd_mtproto "$@" ;;
