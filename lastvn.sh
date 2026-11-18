@@ -9,6 +9,7 @@
 #   sudo bash lastvn.sh list             — список пользователей
 #   sudo bash lastvn.sh link <имя>       — подписка, ссылка и QR-код для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
+#   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
 #   sudo bash lastvn.sh uninstall        — удалить всё
 
 set -euo pipefail
@@ -65,14 +66,35 @@ install_xray() {
   [[ -x "$XRAY_BIN" ]] || die "xray не установился"
 }
 
-enable_bbr() {
-  if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-    cat > /etc/sysctl.d/99-lastvn-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-    sysctl --system >/dev/null 2>&1 || true
-  fi
+# Ускорение сети: BBR + большие TCP-буферы (важны для гигабита и высокого пинга).
+tune_network() {
+  rm -f /etc/sysctl.d/99-lastvn-bbr.conf
+  cat > /etc/sysctl.d/99-lastvn.conf <<'SYSCTL'
+# LastVN: ускорение сети
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.tcp_rmem = 4096 1048576 67108864
+net.ipv4.tcp_wmem = 4096 1048576 67108864
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 1024 65535
+SYSCTL
+  modprobe tcp_bbr 2>/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
+  # Лимит открытых файлов для xray (много соединений).
+  mkdir -p /etc/systemd/system/xray.service.d
+  printf '[Service]\nLimitNOFILE=1048576\n' > /etc/systemd/system/xray.service.d/99-lastvn.conf
+  systemctl daemon-reload
 }
 
 open_port() {
@@ -305,7 +327,7 @@ cmd_install() {
   port_free "$port"
   port_free "$sub_port"
   install_xray
-  enable_bbr
+  tune_network
 
   local ip priv pub sid path uuid
   ip=$(server_ip)
@@ -391,17 +413,24 @@ cmd_status() {
   echo "nginx:    $(systemctl is-active nginx)"
 }
 
+cmd_tune() {
+  need_root
+  tune_network
+  systemctl restart xray 2>/dev/null || true
+  green "Сеть настроена: $(sysctl -n net.ipv4.tcp_congestion_control), TCP-буферы до 64 МБ"
+}
+
 cmd_uninstall() {
   need_root
   read -r -p "Удалить Xray, подписки и все ключи пользователей? [y/N] " ans
   [[ $ans =~ ^[Yy]$ ]] || exit 0
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
-  rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" /etc/sysctl.d/99-lastvn-bbr.conf
+  rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" /etc/sysctl.d/99-lastvn.conf /etc/sysctl.d/99-lastvn-bbr.conf /etc/systemd/system/xray.service.d/99-lastvn.conf
   systemctl reload nginx 2>/dev/null || true
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -551,6 +580,7 @@ case ${1:-} in
   list)      cmd_list ;;
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
+  tune)      cmd_tune ;;
   uninstall) cmd_uninstall ;;
   *)         usage ;;
 esac
