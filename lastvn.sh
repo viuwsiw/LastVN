@@ -10,6 +10,7 @@
 #   sudo bash lastvn.sh link <имя>       — подписка и ключ для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
+#   sudo bash lastvn.sh logs             — ссылки на логи тестов и состояния сервера
 #   sudo bash lastvn.sh selfsteal [домен] — маскировка под свой сайт (против шейпинга DPI)
 #   sudo bash lastvn.sh speed            — проверить канал сервера и нагрузку CPU
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
@@ -268,8 +269,12 @@ EOF
   title_b64=$(printf '%s' "$TITLE" | base64 -w0)
   if [[ -n $support ]]; then support_hdr="add_header support-url \"$support\" always;"; fi
 
+  local logdir; logdir=$(log_dir)
+  mkdir -p "$logdir"
   cat > "$NGINX_CONF" <<EOF
 # LastVN: сервер подписок (Happ, INCY, v2rayNG, Hiddify и др.)
+log_format lastvn_speed '\$time_iso8601 ip=\$remote_addr down=\$arg_d up=\$arg_u note="\$arg_n" ua="\$http_user_agent"';
+
 server {
     listen $sub_port;
     listen [::]:$sub_port;
@@ -285,6 +290,10 @@ server {
     location = /speed { default_type text/html; charset utf-8; try_files /speed.html =404; }
     location = /down  { add_header Cache-Control "no-store" always; try_files /down.bin =404; }
     location = /up    { client_max_body_size 0; client_body_buffer_size 1m; add_header Cache-Control "no-store" always; return 204; }
+    location = /log   { access_log $logdir/speed.log lastvn_speed; add_header Cache-Control "no-store" always; return 204; }
+
+    # Логи: только по секретному пути (токен первого пользователя), без листинга.
+    location /logs/ { default_type text/plain; charset utf-8; add_header Cache-Control "no-store" always; autoindex off; }
 
     location /sub/ {
         default_type text/plain;
@@ -344,7 +353,8 @@ async function up(){
 }
 $('b').onclick=async()=>{$('b').disabled=true;$('d').textContent=$('u').textContent='…';
   try{$('s').textContent='Скачивание…';$('d').textContent=await down();
-      $('s').textContent='Выгрузка…';$('u').textContent=await up();$('s').textContent='Готово';}
+      $('s').textContent='Выгрузка…';$('u').textContent=await up();$('s').textContent='Готово — результат записан в лог';
+      fetch('/log?d='+$('d').textContent+'&u='+$('u').textContent+'&n=direct',{cache:'no-store'});}
   catch(e){$('s').textContent='Ошибка: '+e}
   $('b').disabled=false};
 </script></body></html>
@@ -422,6 +432,7 @@ EOF
   write_web "$ip" "$sub_port" "$support"
   write_speedtest
   rebuild_subs
+  install_monitor
 
   green "Готово! VLESS + XHTTP + Reality работает на $ip:$port (маскировка под $sni)"
   show_user "$name"
@@ -629,7 +640,9 @@ cmd_upgrade() {
   write_web "$SERVER_IP" "$SUB_PORT" "$support"
   write_speedtest
   rebuild_subs
+  install_monitor
   echo "Спидтест до сервера (без VPN): http://$SERVER_IP:$SUB_PORT/speed"
+  cmd_logs
   green "Конфиг обновлён (VLESS + XHTTP + Reality). Ключи, ссылки и подписки прежние."
   local name
   for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
@@ -758,6 +771,114 @@ cmd_selfsteal() {
   for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
 }
 
+# ---------- логи для диагностики ----------
+SELF="/usr/local/sbin/lastvn"
+MON_UNIT="/etc/systemd/system/lastvn-monitor.service"
+
+log_dir() {
+  local tok; tok=$(awk 'NR==1 {print $2}' "$TOKENS" 2>/dev/null || true)
+  [[ -n $tok ]] || tok=nologs
+  echo "$WEB/logs/$tok"
+}
+
+logs_url() {
+  # shellcheck disable=SC1090
+  source "$STATE"
+  echo "http://$SERVER_IP:$SUB_PORT/logs/$(basename "$(log_dir)")/"
+}
+
+install_self() {
+  # Копия скрипта в системный путь — для службы мониторинга и удобного вызова «lastvn ...».
+  [[ "$(readlink -f "$0")" == "$SELF" ]] || install -m 755 "$0" "$SELF"
+}
+
+# Раз в секунду: трафик интерфейса (Мбит/с) и CPU. Пишем строку, если есть заметный трафик,
+# и раз в минуту — снимок состояния (status.txt). Так видно, что происходит во время каждого теста.
+# rx tx (байты) интерфейса; формат /proc/net/dev бывает «eth0: 123» и «eth0:123».
+net_bytes() {
+  awk -v i="$1" '{l=$0; sub(/^ +/, "", l); n=index(l, ":"); if (substr(l, 1, n-1) == i) {split(substr(l, n+1), f, " "); print f[1], f[9]; found=1}}
+                 END {if (!found) print 0, 0}' /proc/net/dev
+}
+
+cmd_monitor_loop() {
+  local dir iface prx ptx pidle ptotal n=0
+  dir=$(log_dir); mkdir -p "$dir"
+  iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+  [[ -n $iface ]] || iface=$(awk -F'\t' '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null || true)
+  [[ -n $iface ]] || iface=eth0
+  read -r prx ptx < <(net_bytes "$iface")
+  read -r pidle ptotal < <(awk '/^cpu / {t=0; for(i=2;i<=NF;i++) t+=$i; print $5+$6, t}' /proc/stat)
+  while sleep 1; do
+    local rx tx idle total drx dtx cpu
+    read -r rx tx < <(net_bytes "$iface")
+    read -r idle total < <(awk '/^cpu / {t=0; for(i=2;i<=NF;i++) t+=$i; print $5+$6, t}' /proc/stat)
+    drx=$(( (rx - prx) * 8 / 1000000 )); dtx=$(( (tx - ptx) * 8 / 1000000 ))
+    cpu=$(( total > ptotal ? 100 - 100 * (idle - pidle) / (total - ptotal) : 0 ))
+    prx=$rx; ptx=$tx; pidle=$idle; ptotal=$total
+    if (( drx >= 2 || dtx >= 2 )); then
+      printf '%s rx(от клиентов)=%sMbit tx(к клиентам)=%sMbit cpu=%s%% conn443=%s\n' \
+        "$(date '+%F %T')" "$drx" "$dtx" "$cpu" \
+        "$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)" >> "$dir/net.log"
+    fi
+    if (( n++ % 60 == 0 )); then
+      write_status "$dir" > "$dir/status.txt.tmp" 2>&1 && mv "$dir/status.txt.tmp" "$dir/status.txt"
+      if [[ $(stat -c %s "$dir/net.log" 2>/dev/null || echo 0) -gt 5000000 ]]; then
+        tail -n 20000 "$dir/net.log" > "$dir/net.log.tmp" && mv "$dir/net.log.tmp" "$dir/net.log"
+      fi
+    fi
+  done
+}
+
+write_status() {
+  echo "== $(date '+%F %T %Z')   $(uptime -p)   load: $(cut -d' ' -f1-3 /proc/loadavg)"
+  echo "CPU: $(nproc)   RAM: $(free -m | awk '/Mem:/ {print $3"/"$2" МБ"}')   kernel: $(uname -r)"
+  echo "xray: $(systemctl is-active xray) ($("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}'))   nginx: $(systemctl is-active nginx)   mtg: $(systemctl is-active mtg 2>/dev/null)"
+  echo "cc: $(sysctl -n net.ipv4.tcp_congestion_control)  qdisc: $(sysctl -n net.core.default_qdisc)  rmem_max: $(sysctl -n net.core.rmem_max)  tfo: $(sysctl -n net.ipv4.tcp_fastopen)"
+  echo "соединений на 443: $(ss -Htn state established '( sport = :443 )' | wc -l)   на 8443: $(ss -Htn state established '( sport = :8443 )' | wc -l)"
+  echo "TCP: $(ss -s | sed -n 's/^TCP: *//p')"
+  echo "retrans: $(nstat -az TcpRetransSegs 2>/dev/null | awk '/TcpRetransSegs/ {print $2}')"
+  echo
+  echo "== конфиг Xray (без приватного ключа)"
+  jq -c '.inbounds[] | {tag, port, net: .streamSettings.network, xhttp: .streamSettings.xhttpSettings,
+          sni: .streamSettings.realitySettings.serverNames, target: .streamSettings.realitySettings.target,
+          users: (.settings.clients | length)}' "$CONFIG" 2>/dev/null
+  echo
+  echo "== журнал xray (последние 40)"
+  journalctl -u xray -n 40 --no-pager -o short-iso 2>/dev/null | sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g'
+  echo
+  echo "== журнал mtg (последние 20)"
+  journalctl -u mtg -n 20 --no-pager -o short-iso 2>/dev/null
+}
+
+install_monitor() {
+  install_self
+  cat > "$MON_UNIT" <<UNIT
+[Unit]
+Description=LastVN monitor (логи трафика и состояния)
+After=network-online.target
+
+[Service]
+ExecStart=$SELF monitor-loop
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable lastvn-monitor >/dev/null 2>&1
+  systemctl restart lastvn-monitor
+}
+
+cmd_logs() {
+  need_installed
+  echo "Логи (открываются в браузере):"
+  echo "  $(logs_url)status.txt  — состояние сервера, журналы xray и mtg"
+  echo "  $(logs_url)net.log     — трафик по секундам во время тестов"
+  echo "  $(logs_url)speed.log   — результаты спидтеста http://IP:$SUB_PORT/speed"
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -771,12 +892,14 @@ cmd_uninstall() {
   [[ $ans =~ ^[Yy]$ ]] || exit 0
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
   if [[ -f $MTG_CONF ]]; then cmd_mtproto_remove; fi
+  systemctl disable --now lastvn-monitor 2>/dev/null || true
+  rm -f "$MON_UNIT" "$SELF"
   rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" "$SELFSTEAL_CONF" /etc/nginx/conf.d/lastvn-http.conf /etc/lastvn /etc/sysctl.d/99-lastvn.conf /etc/sysctl.d/99-lastvn-bbr.conf /etc/systemd/system/xray.service.d/99-lastvn.conf
   systemctl reload nginx 2>/dev/null || true
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -927,6 +1050,8 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  logs)      cmd_logs ;;
+  monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
   speed)     cmd_speed ;;
   upgrade)   cmd_upgrade ;;
