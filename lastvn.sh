@@ -161,8 +161,7 @@ write_config() {
       },
       streamSettings: {
         network: "xhttp",
-        # Крупнее POST-запросы и больше буфер — быстрее выгрузка при высоком пинге (packet-up).
-        xhttpSettings: { path: $path, mode: "auto", scMaxEachPostBytes: 4000000, scMaxBufferedPosts: 120 },
+        xhttpSettings: { path: $path, mode: "auto" },
         security: "reality",
         realitySettings: {
           show: false,
@@ -228,9 +227,11 @@ make_link() {
   source "$STATE"
   # xmux: клиент держит до 8 параллельных TCP-соединений вместо одного — так скорость
   # не упирается в одно соединение (потери/пинг) ни на скачивании, ни на выгрузке.
-  # packet-up: выгрузка отдельными POST до 4 МБ каждые 10 мс, разложенными по соединениям xmux.
-  local extra='{"scMaxEachPostBytes":4000000,"scMinPostsIntervalMs":10,"xmux":{"maxConnections":8,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000"}}'
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=packet-up&extra=%s#%s\n' \
+  # stream-up: выгрузка одним длинным потоком на соединение — по замерам лучше всего
+  # переживает потери и шейпинг на маршруте (packet-up терял и пересобирал куски).
+  # xmux: до 8 параллельных соединений вместо одного.
+  local extra='{"xmux":{"maxConnections":8,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000"}}'
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=stream-up&extra=%s#%s\n' \
     "$uuid" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$(urlencode "$XHTTP_PATH")" "$(urlencode "$extra")" "$(urlencode "$TITLE")"
 }
 
