@@ -281,6 +281,11 @@ server {
     location = / { try_files /index.html =404; }
     location = /logo.png { }
 
+    # Спидтест «напрямую до сервера, без VPN»: /speed — страница, /down — 100 МБ, /up — приём POST.
+    location = /speed { default_type text/html; charset utf-8; try_files /speed.html =404; }
+    location = /down  { add_header Cache-Control "no-store" always; try_files /down.bin =404; }
+    location = /up    { client_max_body_size 0; client_body_buffer_size 1m; add_header Cache-Control "no-store" always; return 204; }
+
     location /sub/ {
         default_type text/plain;
         charset utf-8;
@@ -299,6 +304,52 @@ EOF
   nginx -t >/dev/null 2>&1 || die "конфиг nginx невалиден: nginx -t"
   systemctl enable nginx >/dev/null 2>&1
   systemctl restart nginx
+}
+
+write_speedtest() {
+  # 100 МБ случайных данных (не сжимаются по пути).
+  [[ -s $WEB/down.bin ]] || head -c 100000000 /dev/urandom > "$WEB/down.bin"
+  cat > "$WEB/speed.html" <<'HTML'
+<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LastVN Speed</title><link rel="icon" href="/logo.png">
+<style>
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;color:#bbb;font:18px system-ui,sans-serif;padding:16px;box-sizing:border-box}
+img{width:96px;height:96px}.v{font-size:44px;color:#fff;font-variant-numeric:tabular-nums}
+.row{display:flex;gap:40px;margin:24px 0;text-align:center}button{font:inherit;padding:12px 28px;border-radius:10px;border:0;background:#9a9a9a;color:#000;cursor:pointer}
+button:disabled{opacity:.5}small{color:#777;text-align:center;max-width:420px}
+</style></head><body>
+<img src="/logo.png" alt=""><h2>Скорость до сервера LastVN</h2>
+<small>Выключи VPN перед тестом — так видно, режет ли провайдер канал до этого сервера.</small>
+<div class="row"><div>Скачивание<div class="v" id="d">—</div>Мбит/с</div><div>Выгрузка<div class="v" id="u">—</div>Мбит/с</div></div>
+<button id="b">Начать</button>
+<small id="s"></small>
+<script>
+const P=6, T=10000, $=id=>document.getElementById(id);
+function mbps(bytes,ms){return (bytes*8/ms/1000).toFixed(0)}
+async function down(){
+  let bytes=0, t0=performance.now(), stop=false;
+  const one=async()=>{while(!stop){const r=await fetch('/down?'+Math.random(),{cache:'no-store'});const rd=r.body.getReader();
+    for(;;){const {done,value}=await rd.read();if(done)break;bytes+=value.length;$('d').textContent=mbps(bytes,performance.now()-t0);
+      if(performance.now()-t0>T){stop=true;rd.cancel();break}}}};
+  await Promise.all(Array.from({length:P},one)); return mbps(bytes,performance.now()-t0);
+}
+async function up(){
+  const chunk=new Uint8Array(1<<20); for(let i=0;i<chunk.length;i+=65536)crypto.getRandomValues(chunk.subarray(i,i+65536));
+  const blob=new Blob(Array(8).fill(chunk)); // 8 МБ на запрос
+  let bytes=0, t0=performance.now();
+  const one=async()=>{while(performance.now()-t0<T){await fetch('/up?'+Math.random(),{method:'POST',body:blob,cache:'no-store'});
+    bytes+=blob.size;$('u').textContent=mbps(bytes,performance.now()-t0)}};
+  await Promise.all(Array.from({length:P},one)); return mbps(bytes,performance.now()-t0);
+}
+$('b').onclick=async()=>{$('b').disabled=true;$('d').textContent=$('u').textContent='…';
+  try{$('s').textContent='Скачивание…';$('d').textContent=await down();
+      $('s').textContent='Выгрузка…';$('u').textContent=await up();$('s').textContent='Готово';}
+  catch(e){$('s').textContent='Ошибка: '+e}
+  $('b').disabled=false};
+</script></body></html>
+HTML
+  chmod -R a+rX "$WEB"
 }
 
 show_user() {
@@ -369,6 +420,7 @@ EOF
   systemctl enable xray >/dev/null 2>&1
   test_and_restart
   write_web "$ip" "$sub_port" "$support"
+  write_speedtest
   rebuild_subs
 
   green "Готово! VLESS + XHTTP + Reality работает на $ip:$port (маскировка под $sni)"
@@ -571,7 +623,13 @@ cmd_upgrade() {
   fi
   tune_network
   test_and_restart
+  local support; support=$(sed -n 's/.*add_header support-url "\([^"]*\)".*/\1/p' "$NGINX_CONF" 2>/dev/null || true)
+  # shellcheck disable=SC1090
+  source "$STATE"
+  write_web "$SERVER_IP" "$SUB_PORT" "$support"
+  write_speedtest
   rebuild_subs
+  echo "Спидтест до сервера (без VPN): http://$SERVER_IP:$SUB_PORT/speed"
   green "Конфиг обновлён (VLESS + XHTTP + Reality). Ключи, ссылки и подписки прежние."
   local name
   for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
