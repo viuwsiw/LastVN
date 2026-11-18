@@ -189,7 +189,9 @@ write_config() {
   }' > "$CONFIG"
   if [[ -n ${LAB_PORT:-} ]]; then
     local tmp; tmp=$(mktemp)
-    jq --argjson lp "$LAB_PORT" '.inbounds += [.inbounds[0] | .tag = "lab" | .port = $lp]' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+    jq --argjson lp "$LAB_PORT" --arg ls "${LAB_SNI:-}" '.inbounds += [.inbounds[0] | .tag = "lab" | .port = $lp
+        | if $ls != "" then .streamSettings.realitySettings.target = ($ls + ":443")
+                           | .streamSettings.realitySettings.serverNames = [$ls] else . end]' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
   fi
   chmod 644 "$CONFIG"
 }
@@ -637,7 +639,9 @@ cmd_upgrade() {
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
   [[ -n $priv && $priv != null && -n $path && $path != null ]] || die "не удалось прочитать текущий конфиг"
-  local LAB_PORT; LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+  local LAB_PORT LAB_SNI
+  LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+  LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -768,7 +772,9 @@ cmd_selfsteal() {
   path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
-  local LAB_PORT; LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+  local LAB_PORT LAB_SNI
+  LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+  LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -900,16 +906,22 @@ cmd_logs() {
 # Лаборатория: копия VPN-входа на втором порту, чтобы сравнивать по логам (порт/режим).
 cmd_lab() {
   need_root; need_installed
-  local arg=${1:-on}
-  sed -i '/^LAB_PORT=/d' "$STATE"
+  local arg=${1:-on} lsni=""
+  [[ ${2:-} == --sni ]] && lsni=${3:-}
+  [[ $arg == --sni ]] && { lsni=${2:-}; arg=on; }
+  sed -i '/^LAB_PORT=/d; /^LAB_SNI=/d' "$STATE"
   if [[ $arg == off ]]; then
     green "Лаборатория выключена"
   else
     local lp=2083; [[ $arg =~ ^[0-9]+$ ]] && lp=$arg
     port_free "$lp"
     echo "LAB_PORT=$lp" >> "$STATE"
+    if [[ -n $lsni ]]; then
+      echo "LAB_SNI=$lsni" >> "$STATE"
+      check_sni "$lsni"
+    fi
     open_port "$lp"
-    green "Лаборатория: копия VPN на порту $lp"
+    green "Лаборатория: копия VPN на порту $lp${lsni:+, маска $lsni}"
   fi
   cmd_upgrade >/dev/null
   green "Конфиг применён"
