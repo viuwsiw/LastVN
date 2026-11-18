@@ -93,12 +93,13 @@ server_ip() {
   die "не удалось определить внешний IP сервера"
 }
 
-# Совместимо со старым ("Private key:/Public key:") и новым ("PrivateKey:/Password:") выводом xray x25519.
+# Совместимо со всеми форматами xray x25519: "Private key/Public key", "PrivateKey/Password", "PrivateKey/Password (PublicKey)".
 gen_keys() {
   local out priv pub
   out=$("$XRAY_BIN" x25519)
-  priv=$(awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2}' <<<"$out")
-  pub=$(awk -F': *' 'tolower($1) ~ /^(public ?key|password)$/ {print $2}' <<<"$out")
+  # Ключ поля нормализуем: "Password (PublicKey)" -> "passwordpublickey", "Private key" -> "privatekey".
+  priv=$(awk -F': *' '{k=tolower($1); gsub(/[^a-z0-9]/,"",k)} k=="privatekey" {print $2}' <<<"$out")
+  pub=$(awk -F': *' '{k=tolower($1); gsub(/[^a-z0-9]/,"",k)} k=="publickey"||k=="password"||k=="passwordpublickey" {print $2}' <<<"$out")
   [[ -n $priv && -n $pub ]] || die "не удалось распарсить вывод xray x25519: $out"
   echo "$priv $pub"
 }
