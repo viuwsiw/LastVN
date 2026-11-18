@@ -47,8 +47,11 @@ port_free() {
 # ---------- зависимости ----------
 install_deps() {
   if command -v apt-get >/dev/null; then
+    # Без интерактивных вопросов (needrestart, замена конфигов dpkg и т.п.)
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl qrencode unzip nginx ca-certificates iproute2 >/dev/null
+    apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+      curl jq openssl qrencode unzip nginx ca-certificates iproute2 >/dev/null
   elif command -v dnf >/dev/null; then
     dnf install -y -q curl jq openssl qrencode unzip nginx ca-certificates iproute
   else
