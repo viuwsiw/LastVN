@@ -10,6 +10,8 @@
 #   sudo bash lastvn.sh link <имя>       — подписка, ссылка и QR-код для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
+#   sudo bash lastvn.sh mtproto [--port 8443] [--domain www.google.com] — прокси для Telegram
+#   sudo bash lastvn.sh mtproto-remove   — удалить прокси для Telegram
 #   sudo bash lastvn.sh uninstall        — удалить всё
 
 set -euo pipefail
@@ -411,6 +413,122 @@ cmd_status() {
   echo "Xray:     $("$XRAY_BIN" version | head -1)"
   echo "xray:     $(systemctl is-active xray)"
   echo "nginx:    $(systemctl is-active nginx)"
+  if [[ -f $MTG_CONF ]]; then echo "mtg:      $(systemctl is-active mtg)   $(mtg_link)"; fi
+}
+
+# ---------- MTProto-прокси для Telegram (mtg, FakeTLS) ----------
+MTG_BIN="/usr/local/bin/mtg"
+MTG_CONF="/etc/mtg.toml"
+MTG_UNIT="/etc/systemd/system/mtg.service"
+
+install_mtg_bin() {
+  local arch url tmp
+  case $(uname -m) in
+    x86_64|amd64)  arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) die "архитектура $(uname -m) не поддерживается для mtg" ;;
+  esac
+  url=$(curl -fsSL https://api.github.com/repos/9seconds/mtg/releases/latest 2>/dev/null \
+        | jq -r --arg a "linux-$arch.tar.gz" '.assets[] | select(.name | endswith($a)) | .browser_download_url' 2>/dev/null | head -1 || true)
+  if [[ -z $url ]]; then
+    # Запасной путь без API: версия из редиректа /releases/latest -> /releases/tag/vX.Y.Z
+    local tag
+    tag=$(curl -fsSI https://github.com/9seconds/mtg/releases/latest | tr -d '\r' | sed -n 's#^[Ll]ocation:.*/tag/##p')
+    [[ -n $tag ]] || die "не нашёл релиз mtg на GitHub"
+    url="https://github.com/9seconds/mtg/releases/download/$tag/mtg-${tag#v}-linux-$arch.tar.gz"
+  fi
+  tmp=$(mktemp -d)
+  curl -fsSL "$url" -o "$tmp/mtg.tar.gz"
+  tar -xzf "$tmp/mtg.tar.gz" -C "$tmp"
+  install -m 755 "$(find "$tmp" -type f -name mtg | head -1)" "$MTG_BIN"
+  rm -rf "$tmp"
+  "$MTG_BIN" --help >/dev/null 2>&1 || die "mtg не запускается"
+}
+
+mtg_link() {
+  local secret port ip
+  secret=$(sed -n 's/^secret *= *"\(.*\)"/\1/p' "$MTG_CONF")
+  port=$(sed -n 's/^bind-to *= *".*:\([0-9]*\)"/\1/p' "$MTG_CONF")
+  ip=$(sed -n 's/^SERVER_IP=//p' "$STATE" 2>/dev/null)
+  [[ -n $ip ]] || ip=$(server_ip)
+  echo "https://t.me/proxy?server=$ip&port=$port&secret=$secret"
+}
+
+show_mtg() {
+  local link; link=$(mtg_link)
+  echo
+  green "MTProto-прокси для Telegram:"
+  echo "  $link"
+  echo
+  if command -v qrencode >/dev/null; then
+    if [[ ${TERM:-} == linux ]]; then qrencode -t ANSI "$link"; else qrencode -t ANSIUTF8 "$link"; fi
+  fi
+}
+
+cmd_mtproto() {
+  need_root
+  local port=8443 domain="www.google.com"
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --port)   port=$2;   shift 2 ;;
+      --domain) domain=$2; shift 2 ;;
+      *) die "неизвестный параметр: $1" ;;
+    esac
+  done
+  if [[ -f $MTG_CONF ]]; then
+    show_mtg
+    yellow "Прокси уже установлен. Пересоздать: $0 mtproto-remove, затем $0 mtproto"
+    return
+  fi
+  valid_port "$port" || die "неверный порт: $port"
+  command -v jq >/dev/null || install_deps
+  port_free "$port"
+
+  yellow "Устанавливаю mtg (MTProto-прокси)..."
+  install_mtg_bin
+  local secret; secret=$("$MTG_BIN" generate-secret --hex "$domain")
+  [[ $secret == ee* ]] || die "не удалось сгенерировать секрет: $secret"
+
+  cat > "$MTG_CONF" <<CONF
+# LastVN: MTProto-прокси (FakeTLS под $domain)
+secret = "$secret"
+bind-to = "0.0.0.0:$port"
+CONF
+  chmod 644 "$MTG_CONF"   # mtg работает под DynamicUser; секрет всё равно уходит клиентам в ссылке
+
+  cat > "$MTG_UNIT" <<UNIT
+[Unit]
+Description=LastVN MTProto proxy (mtg)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$MTG_BIN run $MTG_CONF
+Restart=always
+RestartSec=3
+DynamicUser=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  open_port "$port"
+  systemctl daemon-reload
+  systemctl enable --now mtg >/dev/null 2>&1
+  sleep 1
+  systemctl is-active --quiet mtg || die "mtg не запустился: journalctl -u mtg -n 50"
+
+  green "Готово! MTProto-прокси работает на порту $port (маскировка под $domain)"
+  show_mtg
+}
+
+cmd_mtproto_remove() {
+  need_root
+  systemctl disable --now mtg 2>/dev/null || true
+  rm -f "$MTG_UNIT" "$MTG_CONF" "$MTG_BIN"
+  systemctl daemon-reload
+  green "MTProto-прокси удалён"
 }
 
 cmd_tune() {
@@ -425,12 +543,13 @@ cmd_uninstall() {
   read -r -p "Удалить Xray, подписки и все ключи пользователей? [y/N] " ans
   [[ $ans =~ ^[Yy]$ ]] || exit 0
   bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
+  if [[ -f $MTG_CONF ]]; then cmd_mtproto_remove; fi
   rm -rf "$XRAY_DIR" "$WEB" "$NGINX_CONF" /etc/sysctl.d/99-lastvn.conf /etc/sysctl.d/99-lastvn-bbr.conf /etc/systemd/system/xray.service.d/99-lastvn.conf
   systemctl reload nginx 2>/dev/null || true
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -581,6 +700,8 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  mtproto)   shift; cmd_mtproto "$@" ;;
+  mtproto-remove) cmd_mtproto_remove ;;
   uninstall) cmd_uninstall ;;
   *)         usage ;;
 esac

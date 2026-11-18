@@ -54,8 +54,21 @@ sudo bash lastvn.sh install --port 443 --sub-port 2096 --sni www.microsoft.com -
 | `lastvn.sh del <имя>` | удалить пользователя |
 | `lastvn.sh list` | список пользователей |
 | `lastvn.sh link <имя>` | снова показать подписку, ссылку и QR |
-| `lastvn.sh status` | статус сервиса |
+| `lastvn.sh status` | статус сервисов |
+| `lastvn.sh tune` | ускорение сети: BBR, TCP-буферы до 64 МБ, Fast Open |
+| `lastvn.sh mtproto` | MTProto-прокси для Telegram |
+| `lastvn.sh mtproto-remove` | удалить прокси для Telegram |
 | `lastvn.sh uninstall` | удалить всё |
+
+## Прокси для Telegram (MTProto)
+
+```bash
+sudo bash lastvn.sh mtproto
+```
+
+Ставит [mtg](https://github.com/9seconds/mtg) в режиме FakeTLS: для DPI трафик выглядит как HTTPS к `www.google.com`. По умолчанию работает на порту `8443` (443 занят VPN). Выводит ссылку `https://t.me/proxy?...`: открой её на устройстве с Telegram, и прокси добавится в один клик.
+
+Параметры: `--port 8443 --domain www.google.com`.
 
 ## Клиенты (с поддержкой XHTTP)
 
@@ -71,4 +84,5 @@ sudo bash lastvn.sh install --port 443 --sub-port 2096 --sni www.microsoft.com -
 - `/usr/local/etc/xray/lastvn.env` — параметры сервера (IP, публичный ключ, SNI, path)
 - `/usr/local/etc/xray/lastvn.tokens` — токены подписок пользователей
 - `/var/www/lastvn/` и `/etc/nginx/conf.d/lastvn.conf` — сервер подписок
-- логи: `journalctl -u xray -f`
+- `/etc/mtg.toml` — конфиг MTProto-прокси
+- логи: `journalctl -u xray -f`, `journalctl -u mtg -f`
