@@ -10,6 +10,7 @@
 #   sudo bash lastvn.sh link <имя>       — подписка и ключ для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
+#   sudo bash lastvn.sh speed            — проверить канал сервера и нагрузку CPU
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
 #   sudo bash lastvn.sh mtproto [--port 8443] [--domain IP.sslip.io] — прокси для Telegram
 #   sudo bash lastvn.sh mtproto-remove   — удалить прокси для Telegram
@@ -218,8 +219,11 @@ make_link() {
   [[ -n $uuid ]] || die "пользователь '$1' не найден"
   # shellcheck disable=SC1090
   source "$STATE"
-  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto#%s\n' \
-    "$uuid" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$(urlencode "$XHTTP_PATH")" "$(urlencode "$TITLE")"
+  # xmux: клиент держит до 8 параллельных TCP-соединений вместо одного — так скорость
+  # не упирается в одно соединение (потери/пинг) ни на скачивании, ни на выгрузке.
+  local extra='{"xmux":{"maxConnections":8,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000"}}'
+  printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%s&mode=auto&extra=%s#%s\n' \
+    "$uuid" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$(urlencode "$XHTTP_PATH")" "$(urlencode "$extra")" "$(urlencode "$TITLE")"
 }
 
 
@@ -569,6 +573,24 @@ cmd_upgrade() {
   for name in $(jq -r '.[].email' <<<"$clients"); do show_user "$name"; done
 }
 
+# Диагностика скорости: канал самого сервера + нагрузка CPU.
+cmd_speed() {
+  echo "Ядер CPU: $(nproc)   RAM: $(free -m | awk '/Mem:/ {print $2}') МБ"
+  echo "Загрузка: $(cut -d' ' -f1-3 /proc/loadavg)"
+  echo "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  echo
+  echo "Скачивание сервером (Cloudflare, 100 МБ)..."
+  local bps
+  bps=$(curl -s -o /dev/null --max-time 30 -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=100000000' || echo 0)
+  awk -v b="$bps" 'BEGIN {printf "  ↓ %.0f Мбит/с\n", b*8/1000000}'
+  echo "Выгрузка сервером (Cloudflare, 25 МБ)..."
+  bps=$(head -c 25000000 /dev/zero | curl -s -o /dev/null --max-time 30 -w '%{speed_upload}' --data-binary @- 'https://speed.cloudflare.com/__up' || echo 0)
+  awk -v b="$bps" 'BEGIN {printf "  ↑ %.0f Мбит/с\n", b*8/1000000}'
+  echo
+  echo "CPU процессов (во время спидтеста на телефоне запусти: top):"
+  ps -eo comm,%cpu,rss --sort=-%cpu | awk 'NR==1 || /xray|mtg|nginx/' | head -6
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -587,7 +609,7 @@ cmd_uninstall() {
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -738,6 +760,7 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  speed)     cmd_speed ;;
   upgrade)   cmd_upgrade ;;
   mtproto)   shift; cmd_mtproto "$@" ;;
   mtproto-remove) cmd_mtproto_remove ;;
