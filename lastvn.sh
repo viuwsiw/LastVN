@@ -7,7 +7,7 @@
 #   sudo bash lastvn.sh add <имя>        — добавить пользователя
 #   sudo bash lastvn.sh del <имя>        — удалить пользователя
 #   sudo bash lastvn.sh list             — список пользователей
-#   sudo bash lastvn.sh link <имя>       — подписка, ссылка и QR-код для клиента
+#   sudo bash lastvn.sh link <имя>       — подписка и ключ для клиента
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
@@ -55,9 +55,9 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
     apt-get update -qq
     apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-      curl jq openssl qrencode unzip nginx ca-certificates iproute2 >/dev/null
+      curl jq openssl unzip nginx ca-certificates iproute2 >/dev/null
   elif command -v dnf >/dev/null; then
-    dnf install -y -q curl jq openssl qrencode unzip nginx ca-certificates iproute
+    dnf install -y -q curl jq openssl unzip nginx ca-certificates iproute
   else
     die "поддерживаются Ubuntu/Debian и RHEL-подобные системы"
   fi
@@ -294,17 +294,6 @@ EOF
   systemctl restart nginx
 }
 
-# Компактный QR: минимальная рамка и коррекция ошибок L (меньше модулей).
-# В консоли VNC/tty (TERM=linux) блоки UTF-8 не рисуются — там цветные пробелы.
-qr() {
-  command -v qrencode >/dev/null || return 0
-  if [[ ${TERM:-} == linux ]]; then
-    qrencode -t ANSI -m 1 -l L "$1"
-  else
-    qrencode -t UTF8 -m 1 -l L "$1"
-  fi
-}
-
 show_user() {
   local name=$1 sub
   sub=$(sub_url "$name")
@@ -317,8 +306,6 @@ show_user() {
   echo "Ключ VLESS:"
   echo "  $(make_link "$name")"
   echo
-  echo "QR подписки:"
-  qr "$sub"
 }
 
 # ---------- команды ----------
@@ -481,9 +468,6 @@ show_mtg() {
   green "MTProto-прокси для Telegram:"
   echo "  $link"
   echo
-  if command -v qrencode >/dev/null; then
-    qr "$link"
-  fi
 }
 
 cmd_mtproto() {
