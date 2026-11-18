@@ -1,9 +1,9 @@
 # LastVN
 
-Установщик своего VPN на **VLESS + Reality** (Xray-core) для VPS. На одном порту 443 работают два режима:
+Установщик для VPS, два канала:
 
-- **⚡ Быстрый — TCP + Vision.** Максимальная скорость в обе стороны, данные идут через ядро (splice), минимум нагрузки на CPU.
-- **Запасной — XHTTP.** Принимается через fallback того же порта. Включай, если быстрый режим начнут резать.
+1. **VPN — VLESS + XHTTP + Reality** (Xray-core), порт 443.
+2. **Прокси для Telegram — MTProto** (mtg, FakeTLS), порт 8443.
 
 - **Домен не нужен.** Reality выдаёт себя за TLS-соединение к настоящему сайту (по умолчанию `www.microsoft.com`), сертификат не требуется.
 - **XHTTP** — новый транспорт Xray, пришёл на смену WebSocket: обычные HTTP-запросы, сложнее распознать по DPI.
@@ -58,7 +58,7 @@ sudo bash lastvn.sh install --port 443 --sub-port 2096 --sni www.microsoft.com -
 | `lastvn.sh list` | список пользователей |
 | `lastvn.sh link <имя>` | снова показать подписку, ссылку и QR |
 | `lastvn.sh status` | статус сервисов |
-| `lastvn.sh upgrade` | обновить старую установку: добавить Vision, ключи и ссылки сохраняются |
+| `lastvn.sh upgrade` | пересобрать конфиг по новой версии скрипта, ключи и ссылки сохраняются |
 | `lastvn.sh tune` | ускорение сети: BBR, TCP-буферы до 64 МБ, Fast Open |
 | `lastvn.sh mtproto` | MTProto-прокси для Telegram |
 | `lastvn.sh mtproto-remove` | удалить прокси для Telegram |
