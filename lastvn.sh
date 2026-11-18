@@ -188,6 +188,10 @@ write_config() {
       ]
     }
   }' > "$CONFIG"
+  if [[ -n ${LAB_PORT:-} ]]; then
+    local tmp; tmp=$(mktemp)
+    jq --argjson lp "$LAB_PORT" '.inbounds += [.inbounds[0] | .tag = "lab" | .port = $lp]' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+  fi
   chmod 644 "$CONFIG"
 }
 
@@ -632,6 +636,7 @@ cmd_upgrade() {
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
   [[ -n $priv && $priv != null && -n $path && $path != null ]] || die "не удалось прочитать текущий конфиг"
+  local LAB_PORT; LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -762,6 +767,7 @@ cmd_selfsteal() {
   path=$(jq -r '[.inbounds[] | .streamSettings.xhttpSettings.path? // empty][0]' "$CONFIG")
   port=$(jq -r '[.inbounds[] | .port? // empty][0]' "$CONFIG")
   clients=$(config_clients)
+  local LAB_PORT; LAB_PORT=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -822,9 +828,11 @@ cmd_monitor_loop() {
     cpu=$(( total > ptotal ? 100 - 100 * (idle - pidle) / (total - ptotal) : 0 ))
     prx=$rx; ptx=$tx; pidle=$idle; ptotal=$total
     if (( drx >= 2 || dtx >= 2 )); then
-      printf '%s rx(от клиентов)=%sMbit tx(к клиентам)=%sMbit cpu=%s%% conn443=%s\n' \
+      local lp; lp=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true)
+      printf '%s rx(от клиентов)=%sMbit tx(к клиентам)=%sMbit cpu=%s%% conn443=%s%s\n' \
         "$(date '+%F %T')" "$drx" "$dtx" "$cpu" \
-        "$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)" >> "$dir/net.log"
+        "$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)" \
+        "${lp:+ conn$lp=$(ss -Htn state established "( sport = :$lp )" 2>/dev/null | wc -l)}" >> "$dir/net.log"
     fi
     if (( n++ % 60 == 0 )); then
       write_status "$dir" > "$dir/status.txt.tmp" 2>&1 && mv "$dir/status.txt.tmp" "$dir/status.txt"
@@ -843,6 +851,9 @@ write_status() {
   echo "соединений на 443: $(ss -Htn state established '( sport = :443 )' | wc -l)   на 8443: $(ss -Htn state established '( sport = :8443 )' | wc -l)"
   echo "TCP: $(ss -s | sed -n 's/^TCP: *//p')"
   echo "retrans: $(nstat -az TcpRetransSegs 2>/dev/null | awk '/TcpRetransSegs/ {print $2}')"
+  echo
+  echo "== процессы по CPU"
+  ps -eo pid,comm,%cpu,%mem,etime --sort=-%cpu 2>/dev/null | head -8
   echo
   echo "== конфиг Xray (без приватного ключа)"
   jq -c '.inbounds[] | {tag, port, net: .streamSettings.network, xhttp: .streamSettings.xhttpSettings,
@@ -883,6 +894,24 @@ cmd_logs() {
   echo "  $(logs_url)status.txt  — состояние сервера, журналы xray и mtg"
   echo "  $(logs_url)net.log     — трафик по секундам во время тестов"
   echo "  $(logs_url)speed.log   — результаты спидтеста http://IP:$SUB_PORT/speed"
+}
+
+# Лаборатория: копия VPN-входа на втором порту, чтобы сравнивать по логам (порт/режим).
+cmd_lab() {
+  need_root; need_installed
+  local arg=${1:-on}
+  sed -i '/^LAB_PORT=/d' "$STATE"
+  if [[ $arg == off ]]; then
+    green "Лаборатория выключена"
+  else
+    local lp=2083; [[ $arg =~ ^[0-9]+$ ]] && lp=$arg
+    port_free "$lp"
+    echo "LAB_PORT=$lp" >> "$STATE"
+    open_port "$lp"
+    green "Лаборатория: копия VPN на порту $lp"
+  fi
+  cmd_upgrade >/dev/null
+  green "Конфиг применён"
 }
 
 cmd_tune() {
@@ -1056,6 +1085,7 @@ case ${1:-} in
   link)      shift; cmd_link "$@" ;;
   status)    cmd_status ;;
   tune)      cmd_tune ;;
+  lab)       shift; cmd_lab "$@" ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
