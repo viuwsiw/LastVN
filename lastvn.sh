@@ -274,7 +274,11 @@ show_user() {
   echo "Прямая ссылка:"
   echo "  $link"
   echo
-  if command -v qrencode >/dev/null; then echo "QR подписки:"; qrencode -t ANSIUTF8 "$sub"; fi
+  if command -v qrencode >/dev/null; then
+    echo "QR подписки:"
+    # Консоль VNC/tty (TERM=linux) не рисует блоки UTF-8 — там используем цветные пробелы.
+    if [[ ${TERM:-} == linux ]]; then qrencode -t ANSI "$sub"; else qrencode -t ANSIUTF8 "$sub"; fi
+  fi
 }
 
 # ---------- команды ----------
