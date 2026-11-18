@@ -579,11 +579,15 @@ cmd_speed() {
   echo "Загрузка: $(cut -d' ' -f1-3 /proc/loadavg)"
   echo "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control)"
   echo
-  echo "Скачивание сервером (Cloudflare, 100 МБ)..."
-  local bps
-  bps=$(curl -s -o /dev/null --max-time 30 -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=100000000' || echo 0)
-  awk -v b="$bps" 'BEGIN {printf "  ↓ %.0f Мбит/с\n", b*8/1000000}'
-  echo "Выгрузка сервером (Cloudflare, 25 МБ)..."
+  echo "Скачивание сервером:"
+  local bps url
+  for url in 'https://speed.cloudflare.com/__down?bytes=25000000' \
+             'https://proof.ovh.net/files/100Mb.dat' \
+             'https://ash-speed.hetzner.com/100MB.bin'; do
+    bps=$(curl -sf -o /dev/null --max-time 20 -w '%{speed_download}' "$url" || echo 0)
+    awk -v b="$bps" -v u="${url#https://}" 'BEGIN {printf "  ↓ %4.0f Мбит/с   %s\n", b*8/1000000, u}'
+  done
+  echo "Выгрузка сервером (Cloudflare, 25 МБ):"
   bps=$(head -c 25000000 /dev/zero | curl -s -o /dev/null --max-time 30 -w '%{speed_upload}' --data-binary @- 'https://speed.cloudflare.com/__up' || echo 0)
   awk -v b="$bps" 'BEGIN {printf "  ↑ %.0f Мбит/с\n", b*8/1000000}'
   echo
