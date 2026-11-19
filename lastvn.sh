@@ -1067,6 +1067,7 @@ cmd_split() {
 # и пишет результат в лог. Сценарии: основной 443, Reality на SPLIT_PORT, split (выгрузка через :80).
 cmd_selftest() {
   need_root; need_installed
+  local worker=${1:-}; worker=${worker#https://}; worker=${worker%%/*}
   # shellcheck disable=SC1090
   source "$STATE"
   local dir uuid out tmp
@@ -1111,6 +1112,22 @@ cmd_selftest() {
         '{network:"xhttp", security:"none", xhttpSettings:{host:$host, path:$path, mode:"packet-up",
           extra:{downloadSettings:{address:"127.0.0.1", port:$sp, network:"xhttp", security:"reality",
                                    realitySettings:$r, xhttpSettings:{path:$path}}}}}')"
+    fi
+    [[ -n $worker ]] || worker=$(sed -n 's/^SPLIT_WORKER=//p' "$STATE" 2>/dev/null || true)
+    if [[ -n $worker && -n ${SPLIT_PORT:-} ]]; then
+      local wss
+      for mode in packet-up stream-up stream-one; do
+        wss=$(jq -nc --arg w "$worker" --arg path "$XHTTP_PATH" --arg m "$mode" \
+          '{network:"xhttp", security:"tls", tlsSettings:{serverName:$w, fingerprint:"chrome", alpn:["h2","http/1.1"]},
+            xhttpSettings:{host:$w, path:$path, mode:$m}}')
+        run_case "worker-$mode" 10905 "$worker" 443 "$wss"
+        # скорость скачивания через воркер
+        "$XRAY_BIN" run -c "$tmp/worker-$mode.json" > /dev/null 2>&1 & local wp=$!
+        sleep 1
+        printf '   download10MB=%s B/s\n\n' "$(curl -s -o /dev/null --max-time 20 -w '%{speed_download}' \
+          --socks5-hostname 127.0.0.1:10905 'https://speed.cloudflare.com/__down?bytes=10000000' || echo 0)"
+        kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+      done
     fi
     echo "== журнал сервера xray (последние 25)"
     { journalctl -u xray -n 25 --no-pager -o cat 2>/dev/null | grep -v accepted; } || true
@@ -1302,7 +1319,7 @@ case ${1:-} in
   lab)       shift; cmd_lab "$@" ;;
   lab2)      shift; cmd_lab2 "$@" ;;
   split)     shift; cmd_split "$@" ;;
-  selftest)  cmd_selftest ;;
+  selftest)  shift; cmd_selftest "$@" ;;
   debug)     shift; cmd_debug "$@" ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
