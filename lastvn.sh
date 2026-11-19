@@ -1044,7 +1044,7 @@ cmd_selftest() {
            --socks5-hostname "127.0.0.1:$sp" --data-binary @- https://speed.cloudflare.com/__up || echo 0)
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     printf '== %s: generate_204=%s  upload3MB=%s B/s\n' "$name" "$code" "$up"
-    grep -iE 'error|fail|reality|fallback|invalid' "$tmp/$name.log" | grep -v 'Penetrates' | head -12
+    { grep -iE 'error|fail|reality|fallback|invalid' "$tmp/$name.log" | grep -v 'Penetrates' | head -12; } || true
     echo
   }
 
@@ -1063,7 +1063,7 @@ cmd_selftest() {
                                    realitySettings:$r, xhttpSettings:{path:$path}}}}}')"
     fi
     echo "== журнал сервера xray (последние 25)"
-    journalctl -u xray -n 25 --no-pager -o cat 2>/dev/null | grep -v accepted
+    { journalctl -u xray -n 25 --no-pager -o cat 2>/dev/null | grep -v accepted; } || true
   } > "$out" 2>&1
   rm -rf "$tmp"
   cat "$out"
