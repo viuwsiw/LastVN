@@ -11,6 +11,7 @@
 #   sudo bash lastvn.sh status           — статус сервисов
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
 #   sudo bash lastvn.sh logs             — ссылки на логи тестов и состояния сервера
+#   sudo bash lastvn.sh split [порт|off] — выгрузка через Cloudflare Worker, скачивание напрямую
 #   sudo bash lastvn.sh selfsteal [домен] — маскировка под свой сайт (против шейпинга DPI)
 #   sudo bash lastvn.sh speed            — проверить канал сервера и нагрузку CPU
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
@@ -187,6 +188,27 @@ write_config() {
       ]
     }
   }' > "$CONFIG"
+  if [[ -n ${SPLIT_PORT:-} ]]; then
+    # Фронт: VLESS raw + Reality на SPLIT_PORT. XHTTP-клиенты (HTTP/2 внутри Reality) не проходят
+    # проверку VLESS и уходят fallback'ом в локальный XHTTP-инбаунд — туда же nginx (порт 80)
+    # шлёт выгрузку от Cloudflare. Обе половины сессии встречаются в одном инбаунде.
+    local tmp; tmp=$(mktemp)
+    jq --argjson sp "$SPLIT_PORT" --argjson lp "$SPLIT_LOCAL_PORT" '
+      .inbounds[0] as $m |
+      .inbounds += [
+        { tag: "split-front", listen: "0.0.0.0", port: $sp, protocol: "vless",
+          settings: { clients: $m.settings.clients, decryption: "none",
+                      fallbacks: [ { dest: ("127.0.0.1:" + ($lp|tostring)) } ] },
+          streamSettings: { network: "raw", security: "reality",
+                            realitySettings: $m.streamSettings.realitySettings,
+                            sockopt: { tcpFastOpen: true, tcpNoDelay: true } },
+          sniffing: $m.sniffing },
+        { tag: "split-xhttp", listen: "127.0.0.1", port: $lp, protocol: "vless",
+          settings: { clients: $m.settings.clients, decryption: "none" },
+          streamSettings: { network: "xhttp", xhttpSettings: { path: $m.streamSettings.xhttpSettings.path, mode: "auto" } },
+          sniffing: $m.sniffing }
+      ]' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+  fi
   local lab_spec lab_tag lab_port lab_sni
   for lab_spec in "lab:${LAB_PORT:-}:${LAB_SNI:-}" "lab2:${LAB2_PORT:-}:${LAB2_SNI:-}"; do
     IFS=: read -r lab_tag lab_port lab_sni <<<"$lab_spec"
@@ -647,6 +669,7 @@ cmd_upgrade() {
   LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
   LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
+  local SPLIT_PORT; SPLIT_PORT=$(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -699,22 +722,47 @@ SELFSTEAL_PORT=9443
 SELFSTEAL_CONF="/etc/nginx/conf.d/lastvn-selfsteal.conf"
 CERT_DIR="/etc/lastvn/cert"
 
-get_cert() {
-  local domain=$1
-  mkdir -p "$CERT_DIR" /var/www/lastvn-acme
-  # Порт 80: ACME-проверка Let's Encrypt + редирект на https.
+# Порт 80: ACME-проверка Let's Encrypt, редирект на https и (в режиме split)
+# приём XHTTP-выгрузки от Cloudflare Worker -> локальный XHTTP-инбаунд Xray.
+SPLIT_LOCAL_PORT=10000
+write_http80() {
+  local domain=$1 split_loc=""
+  local xpath; xpath=$(sed -n 's/^XHTTP_PATH=//p' "$STATE" 2>/dev/null || true)
+  if [[ -n $(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true) && -n $xpath ]]; then
+    split_loc="location ^~ $xpath {
+        proxy_pass http://127.0.0.1:$SPLIT_LOCAL_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header Connection \"\";
+        proxy_request_buffering off;
+        proxy_buffering off;
+        client_max_body_size 0;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }"
+  fi
+  mkdir -p /var/www/lastvn-acme
   cat > /etc/nginx/conf.d/lastvn-http.conf <<NGX
 server {
     listen 80;
     listen [::]:80;
     server_name $domain;
     server_tokens off;
+    access_log off;
     location /.well-known/acme-challenge/ { root /var/www/lastvn-acme; }
+    $split_loc
     location / { return 301 https://\$host\$request_uri; }
 }
 NGX
   rm -f /etc/nginx/sites-enabled/default
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx
+  nginx -t >/dev/null 2>&1 || die "конфиг nginx невалиден: nginx -t"
+  systemctl reload nginx
+}
+
+get_cert() {
+  local domain=$1
+  mkdir -p "$CERT_DIR" /var/www/lastvn-acme
+  write_http80 "$domain"
   open_port 80
 
   if ! command -v certbot >/dev/null; then
@@ -782,6 +830,7 @@ cmd_selfsteal() {
   LAB_SNI=$(sed -n 's/^LAB_SNI=//p' "$STATE" 2>/dev/null || true)
   LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
+  local SPLIT_PORT; SPLIT_PORT=$(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -842,7 +891,7 @@ cmd_monitor_loop() {
     cpu=$(( total > ptotal ? 100 - 100 * (idle - pidle) / (total - ptotal) : 0 ))
     prx=$rx; ptx=$tx; pidle=$idle; ptotal=$total
     if (( drx >= 2 || dtx >= 2 )); then
-      local lp lp2; lp=$(sed -n 's/^LAB_PORT=//p' "$STATE" 2>/dev/null || true); lp2=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
+      local lp lp2; lp=$(sed -n 's/^LAB_PORT=//p; s/^SPLIT_PORT=//p' "$STATE" 2>/dev/null | head -1 || true); lp2=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
       printf '%s rx(от клиентов)=%sMbit tx(к клиентам)=%sMbit cpu=%s%% conn443=%s%s\n' \
         "$(date '+%F %T')" "$drx" "$dtx" "$cpu" \
         "$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l)" \
@@ -938,6 +987,31 @@ lab_generic() {
   green "Конфиг применён"
 }
 
+# Split: выгрузка через Cloudflare Worker (её ТСПУ не режет), скачивание — напрямую через Reality.
+cmd_split() {
+  need_root; need_installed
+  local arg=${1:-on}
+  # shellcheck disable=SC1090
+  source "$STATE"
+  sed -i '/^SPLIT_PORT=/d' "$STATE"
+  if [[ $arg == off ]]; then
+    cmd_upgrade >/dev/null
+    write_http80 "$SNI"
+    green "Split выключен"; return
+  fi
+  [[ $(jq -r '.inbounds[0].streamSettings.realitySettings.target' "$CONFIG") == 127.0.0.1:* ]] \
+    || die "сначала включи маскировку под свой сайт: $0 selfsteal"
+  local sp=2083; [[ $arg =~ ^[0-9]+$ ]] && sp=$arg
+  # Лаборатории занимают порты — выключаем.
+  sed -i '/^LAB_PORT=/d; /^LAB_SNI=/d; /^LAB2_PORT=/d; /^LAB2_SNI=/d' "$STATE"
+  echo "SPLIT_PORT=$sp" >> "$STATE"
+  open_port "$sp"; open_port 80
+  cmd_upgrade >/dev/null
+  write_http80 "$SNI"
+  green "Split включён: скачивание — Reality на порту $sp, выгрузка — через Cloudflare Worker -> порт 80."
+  echo "Origin для воркера: http://$SNI$XHTTP_PATH"
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -958,7 +1032,7 @@ cmd_uninstall() {
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -1111,6 +1185,7 @@ case ${1:-} in
   tune)      cmd_tune ;;
   lab)       shift; cmd_lab "$@" ;;
   lab2)      shift; cmd_lab2 "$@" ;;
+  split)     shift; cmd_split "$@" ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
