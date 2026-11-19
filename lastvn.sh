@@ -273,6 +273,32 @@ sub_url() {
   echo "http://$SERVER_IP:$SUB_PORT/sub/$(user_token "$1")"
 }
 
+# JSON-конфиг Xray для режима split (Happ понимает JSON-подписки; downloadSettings из ссылки vless:// он игнорирует).
+make_split_json() {
+  local name=$1 uuid; uuid=$(user_uuid "$name")
+  # shellcheck disable=SC1090
+  source "$STATE"
+  jq -n --arg w "$SPLIT_WORKER" --arg id "$uuid" --arg ip "$SERVER_IP" --argjson sp "$SPLIT_PORT" \
+        --arg sni "$SNI" --arg pk "$PUBLIC_KEY" --arg sid "$SHORT_ID" --arg path "$XHTTP_PATH" --arg title "$TITLE" '{
+    remarks: ($title + " ⚡ split"),
+    log: {loglevel: "warning"},
+    inbounds: [{tag: "socks", listen: "127.0.0.1", port: 10808, protocol: "socks", settings: {udp: true},
+                sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}}],
+    outbounds: [
+      {tag: "proxy", protocol: "vless",
+       settings: {vnext: [{address: $w, port: 443, users: [{id: $id, encryption: "none"}]}]},
+       streamSettings: {network: "xhttp", security: "tls",
+         tlsSettings: {serverName: $w, fingerprint: "chrome", alpn: ["h2", "http/1.1"]},
+         xhttpSettings: {host: $w, path: $path, mode: "packet-up",
+           extra: {downloadSettings: {address: $ip, port: $sp, network: "xhttp", security: "reality",
+             realitySettings: {serverName: $sni, fingerprint: "chrome", publicKey: $pk, shortId: $sid},
+             xhttpSettings: {path: $path, mode: "stream-up"}}}}}},
+      {tag: "direct", protocol: "freedom"},
+      {tag: "block", protocol: "blackhole"}],
+    routing: {domainStrategy: "AsIs", rules: [{type: "field", ip: ["geoip:private"], outboundTag: "direct"}]}
+  }'
+}
+
 # Пересобираем файлы подписок: по одному файлу на пользователя, тело — base64 со ссылками.
 rebuild_subs() {
   mkdir -p "$WEB/sub"
@@ -281,6 +307,9 @@ rebuild_subs() {
   while read -r name token; do
     [[ -n $name ]] || continue
     make_link "$name" | base64 -w0 > "$WEB/sub/$token"
+    if grep -q '^SPLIT_WORKER=' "$STATE" && grep -q '^SPLIT_PORT=' "$STATE"; then
+      make_split_json "$name" > "$WEB/sub/$token-split"
+    fi
   done < "$TOKENS"
   chmod -R a+rX "$WEB"
 }
@@ -1002,6 +1031,17 @@ lab_generic() {
 cmd_split() {
   need_root; need_installed
   local arg=${1:-on}
+  if [[ $arg == worker ]]; then
+    local w=${2:-}; w=${w#https://}; w=${w%%/*}
+    [[ $w == *.* ]] || die "укажи адрес воркера: $0 split worker имя.workers.dev"
+    sed -i '/^SPLIT_WORKER=/d' "$STATE"; echo "SPLIT_WORKER=$w" >> "$STATE"
+    rebuild_subs
+    # shellcheck disable=SC1090
+    source "$STATE"
+    green "Подписка split (JSON для Happ):"
+    echo "  http://$SERVER_IP:$SUB_PORT/sub/$(awk 'NR==1 {print $2}' "$TOKENS")-split"
+    return
+  fi
   # shellcheck disable=SC1090
   source "$STATE"
   sed -i '/^SPLIT_PORT=/d' "$STATE"
