@@ -155,7 +155,7 @@ write_config() {
     log: { loglevel: $loglevel },
     inbounds: [{
       tag: "vless-xhttp-reality",
-      listen: "0.0.0.0",
+      listen: "::",
       port: $port,
       protocol: "vless",
       settings: {
