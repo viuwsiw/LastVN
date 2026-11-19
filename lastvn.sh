@@ -149,9 +149,10 @@ write_config() {
   mkdir -p "$XRAY_DIR"
   jq -n \
     --argjson port "$port" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" \
-    --arg path "$path" --argjson clients "$clients" --arg target "$target" '
+    --arg path "$path" --argjson clients "$clients" --arg target "$target" \
+    --arg loglevel "${LOGLEVEL:-warning}" '
   {
-    log: { loglevel: "warning" },
+    log: { loglevel: $loglevel },
     inbounds: [{
       tag: "vless-xhttp-reality",
       listen: "0.0.0.0",
@@ -671,6 +672,7 @@ cmd_upgrade() {
   LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
   local SPLIT_PORT; SPLIT_PORT=$(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true)
+  local LOGLEVEL; LOGLEVEL=$(sed -n 's/^LOGLEVEL=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$sni" "$priv" "$sid" "$path" "$clients" "$target"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -832,6 +834,7 @@ cmd_selfsteal() {
   LAB2_PORT=$(sed -n 's/^LAB2_PORT=//p' "$STATE" 2>/dev/null || true)
   LAB2_SNI=$(sed -n 's/^LAB2_SNI=//p' "$STATE" 2>/dev/null || true)
   local SPLIT_PORT; SPLIT_PORT=$(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true)
+  local LOGLEVEL; LOGLEVEL=$(sed -n 's/^LOGLEVEL=//p' "$STATE" 2>/dev/null || true)
   cp "$CONFIG" "$CONFIG.bak"
   write_config "$port" "$domain" "$priv" "$sid" "$path" "$clients" "127.0.0.1:$SELFSTEAL_PORT"
   if ! "$XRAY_BIN" run -test -c "$CONFIG" >/dev/null; then
@@ -927,6 +930,13 @@ write_status() {
   echo "== журнал xray (последние 40)"
   journalctl -u xray -n 40 --no-pager -o short-iso 2>/dev/null | sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g'
   echo
+  if grep -q '^SPLIT_PORT=' "$STATE" 2>/dev/null; then
+    echo "== split: события за 5 минут"
+    { journalctl -u xray --since "-5min" --no-pager -o cat 2>/dev/null \
+        | grep -iE 'split|fallback|reality|xhttp|splithttp|failed|error|invalid|:2083|session' \
+        | grep -v 'X-Forwarded-For' | sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g' | tail -120; } || true
+    echo
+  fi
   echo "== журнал mtg (последние 20)"
   journalctl -u mtg -n 20 --no-pager -o short-iso 2>/dev/null
 }
@@ -1067,6 +1077,15 @@ cmd_selftest() {
   } > "$out" 2>&1
   rm -rf "$tmp"
   cat "$out"
+}
+
+# Подробный журнал Xray для диагностики: debug on|off
+cmd_debug() {
+  need_root; need_installed
+  sed -i '/^LOGLEVEL=/d' "$STATE"
+  [[ ${1:-on} == off ]] || echo "LOGLEVEL=debug" >> "$STATE"
+  cmd_upgrade >/dev/null
+  green "Журнал Xray: ${1:-on}"
 }
 
 cmd_tune() {
@@ -1244,6 +1263,7 @@ case ${1:-} in
   lab2)      shift; cmd_lab2 "$@" ;;
   split)     shift; cmd_split "$@" ;;
   selftest)  cmd_selftest ;;
+  debug)     shift; cmd_debug "$@" ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
