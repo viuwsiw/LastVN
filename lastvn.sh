@@ -12,6 +12,7 @@
 #   sudo bash lastvn.sh tune             — ускорение сети (BBR, TCP-буферы)
 #   sudo bash lastvn.sh logs             — ссылки на логи тестов и состояния сервера
 #   sudo bash lastvn.sh split [порт|off] — выгрузка через Cloudflare Worker, скачивание напрямую
+#   sudo bash lastvn.sh selftest         — самопроверка входов клиентом Xray на сервере
 #   sudo bash lastvn.sh selfsteal [домен] — маскировка под свой сайт (против шейпинга DPI)
 #   sudo bash lastvn.sh speed            — проверить канал сервера и нагрузку CPU
 #   sudo bash lastvn.sh upgrade          — пересобрать конфиг по последней версии скрипта (ключи сохраняются)
@@ -1012,6 +1013,62 @@ cmd_split() {
   echo "Origin для воркера: http://$SNI$XHTTP_PATH"
 }
 
+# Самопроверка: клиент Xray на самом сервере ходит в свои же входы (без ТСПУ и чужих прокси)
+# и пишет результат в лог. Сценарии: основной 443, Reality на SPLIT_PORT, split (выгрузка через :80).
+cmd_selftest() {
+  need_root; need_installed
+  # shellcheck disable=SC1090
+  source "$STATE"
+  local dir uuid out tmp
+  dir=$(log_dir); mkdir -p "$dir"; out="$dir/selftest.txt"
+  uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG")
+  tmp=$(mktemp -d)
+  local reality
+  reality=$(jq -nc --arg sn "$SNI" --arg pk "$PUBLIC_KEY" --arg sid "$SHORT_ID" \
+    '{serverName:$sn, fingerprint:"chrome", publicKey:$pk, shortId:$sid}')
+
+  run_case() { # имя порт_socks адрес порт streamSettings
+    local name=$1 sp=$2 addr=$3 port=$4 ss=$5 code
+    jq -n --argjson sp "$sp" --arg a "$addr" --argjson p "$port" --arg id "$uuid" --argjson ss "$ss" '
+      { log: {loglevel: "debug"},
+        inbounds: [{listen: "127.0.0.1", port: $sp, protocol: "socks", settings: {udp: false}}],
+        outbounds: [{protocol: "vless", settings: {vnext: [{address: $a, port: $p, users: [{id: $id, encryption: "none"}]}]},
+                     streamSettings: $ss}] }' > "$tmp/$name.json"
+    "$XRAY_BIN" run -c "$tmp/$name.json" > "$tmp/$name.log" 2>&1 &
+    local pid=$!
+    sleep 1
+    code=$(curl -s -o /dev/null --max-time 15 -w '%{http_code} %{time_total}s' \
+           --socks5-hostname "127.0.0.1:$sp" https://www.google.com/generate_204 || true)
+    local up
+    up=$(head -c 3000000 /dev/urandom | curl -s -o /dev/null --max-time 20 -w '%{speed_upload}' \
+           --socks5-hostname "127.0.0.1:$sp" --data-binary @- https://speed.cloudflare.com/__up || echo 0)
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    printf '== %s: generate_204=%s  upload3MB=%s B/s\n' "$name" "$code" "$up"
+    grep -iE 'error|fail|reality|fallback|invalid' "$tmp/$name.log" | grep -v 'Penetrates' | head -12
+    echo
+  }
+
+  {
+    echo "selftest $(date '+%F %T')"
+    run_case main 10901 127.0.0.1 "$PORT" "$(jq -nc --argjson r "$reality" --arg path "$XHTTP_PATH" \
+      '{network:"xhttp", security:"reality", realitySettings:$r, xhttpSettings:{path:$path, mode:"stream-one"}}')"
+    if [[ -n ${SPLIT_PORT:-} ]]; then
+      run_case split-reality 10902 127.0.0.1 "$SPLIT_PORT" "$(jq -nc --argjson r "$reality" --arg path "$XHTTP_PATH" \
+        '{network:"xhttp", security:"reality", realitySettings:$r, xhttpSettings:{path:$path, mode:"stream-one"}}')"
+      run_case split-http80 10903 127.0.0.1 80 "$(jq -nc --arg host "$SNI" --arg path "$XHTTP_PATH" \
+        '{network:"xhttp", security:"none", xhttpSettings:{host:$host, path:$path, mode:"packet-up"}}')"
+      run_case split-full 10904 127.0.0.1 80 "$(jq -nc --argjson r "$reality" --arg host "$SNI" --arg path "$XHTTP_PATH" --argjson sp "$SPLIT_PORT" \
+        '{network:"xhttp", security:"none", xhttpSettings:{host:$host, path:$path, mode:"packet-up",
+          extra:{downloadSettings:{address:"127.0.0.1", port:$sp, network:"xhttp", security:"reality",
+                                   realitySettings:$r, xhttpSettings:{path:$path}}}}}')"
+    fi
+    echo "== журнал сервера xray (последние 25)"
+    journalctl -u xray -n 25 --no-pager -o cat 2>/dev/null | grep -v accepted
+  } > "$out" 2>&1
+  rm -rf "$tmp"
+  cat "$out"
+}
+
 cmd_tune() {
   need_root
   tune_network
@@ -1032,7 +1089,7 @@ cmd_uninstall() {
   green "LastVN удалён (nginx оставлен как пакет)"
 }
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- логотип (assets/logo.png, встроен в base64) ----------
 write_logo() {
@@ -1186,6 +1243,7 @@ case ${1:-} in
   lab)       shift; cmd_lab "$@" ;;
   lab2)      shift; cmd_lab2 "$@" ;;
   split)     shift; cmd_split "$@" ;;
+  selftest)  cmd_selftest ;;
   logs)      cmd_logs ;;
   monitor-loop) cmd_monitor_loop ;;
   selfsteal) shift; cmd_selfsteal "$@" ;;
