@@ -16,6 +16,8 @@ XRAY = Path("/usr/local/etc/xray/config.json")
 TOKENS = XRAY.with_name("lastvn.tokens")
 STATE = XRAY.with_name("lastvn.env")
 REVOKED = Path("/etc/lastos-revoked.json")
+LIVE_LIMITS = Path("/etc/lastos-limits-live")
+LIMITER = Path("/usr/local/sbin/lastos-limits")
 WEB = Path("/var/www/lastvn")
 WS_CONFIG = Path("/etc/lastvn-ws/config.json")
 WS_PROFILE = WS_CONFIG.with_name("profile.tsv")
@@ -214,9 +216,15 @@ def save_revoked(users):
 
 def create_user(name, reactivate=False):
     disabled = revoked_users()
+    if name in records():
+        raise ValueError("Ник уже занят")
     if (name in disabled) != reactivate:
         raise ValueError("Отозванный ключ нужно восстановить в LastOS" if name in disabled else "Ключ не отозван")
+    if LIVE_LIMITS.exists():
+        run(str(LIMITER), "enroll", name)
     run(LASTVN, "add", name, stdout=subprocess.DEVNULL)
+    if LIVE_LIMITS.exists():
+        run(str(LIMITER), "unblock", name)
     if UA_MAP.exists():
         write_nick_map(records())
         reload_nginx()
@@ -314,8 +322,8 @@ def rotate():
         print("Ключ WebSocket тоже заменён. Получить его: lastos-admin ws-link")
 
 
-def apply_credentials(changed, new_tokens, retire_units=()):
-    units = ["xray"]
+def apply_credentials(changed, new_tokens, retire_units=(), live_user=None):
+    units = [] if live_user else ["xray"]
     if WS_CONFIG in changed and service_active("lastvn-ws"):
         units.append("lastvn-ws")
     legacy_running = [unit for unit in retire_units if service_active(unit)]
@@ -343,6 +351,8 @@ rebuild_subs
         saved_sub = stage / "old-sub"
         if not staged_sub.is_dir() or not all((staged_sub / token).is_file() for token in new_tokens.values()):
             raise ValueError("Не удалось подготовить новые подписки")
+        if live_user:
+            run(str(LIMITER), "block", live_user)
         try:
             for path, data in changed.items():
                 atomic_write(path, data)
@@ -371,6 +381,8 @@ rebuild_subs
                 subprocess.run(("systemctl", "restart", service), check=False)
             for service in legacy_running:
                 subprocess.run(("systemctl", "enable", "--now", service), check=False)
+            if live_user:
+                subprocess.run((str(LIMITER), "unblock", live_user), check=False)
             raise
 
 
@@ -408,21 +420,22 @@ def remove_user(name, retain_nick):
         if not retain_nick:
             without_limit_route(config, name)
             changed[XRAY] = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
-        apply_credentials(changed, users)
+        apply_credentials(changed, users, live_user=name if LIVE_LIMITS.exists() else None)
     else:
         config = json.loads(XRAY.read_text())
         if without_limit_route(config, name):
-            apply_credentials({
-                XRAY: json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                TOKENS: TOKENS.read_text(),
-                REVOKED: save_revoked(disabled),
-            }, users)
+            data = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+            if LIVE_LIMITS.exists():
+                atomic_write(XRAY, data)
+                atomic_write(REVOKED, save_revoked(disabled), 0o600)
+            else:
+                apply_credentials({XRAY: data, TOKENS: TOKENS.read_text(),
+                                   REVOKED: save_revoked(disabled)}, users)
         else:
             atomic_write(REVOKED, save_revoked(disabled), 0o600)
     if not retain_nick:
-        limiter = Path("/usr/local/sbin/lastos-limits")
-        if limiter.is_file():
-            run(str(limiter), "forget-deleted", name)
+        if LIMITER.is_file():
+            run(str(LIMITER), "forget-deleted", name)
     print(f"{name}: ключ и подписка отозваны." if retain_nick else f"{name}: пользователь удалён.")
 
 
