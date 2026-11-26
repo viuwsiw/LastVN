@@ -25,7 +25,6 @@ export default {
       headers,
       body: request.body,
       redirect: "manual",
-      duplex: "half",
     });
   },
 };
