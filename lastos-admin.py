@@ -15,6 +15,7 @@ import uuid
 XRAY = Path("/usr/local/etc/xray/config.json")
 TOKENS = XRAY.with_name("lastvn.tokens")
 STATE = XRAY.with_name("lastvn.env")
+REVOKED = Path("/etc/lastos-revoked.json")
 WEB = Path("/var/www/lastvn")
 WS_CONFIG = Path("/etc/lastvn-ws/config.json")
 WS_PROFILE = WS_CONFIG.with_name("profile.tsv")
@@ -203,11 +204,25 @@ def show_link(name):
         print(f"https://{host}:{port}/sub/{records()[name]}")
 
 
-def create_user(name):
+def revoked_users():
+    return set(json.loads(REVOKED.read_text())) if REVOKED.exists() else set()
+
+
+def save_revoked(users):
+    return json.dumps(sorted(users)) + "\n"
+
+
+def create_user(name, reactivate=False):
+    disabled = revoked_users()
+    if (name in disabled) != reactivate:
+        raise ValueError("Отозванный ключ нужно восстановить в LastOS" if name in disabled else "Ключ не отозван")
     run(LASTVN, "add", name, stdout=subprocess.DEVNULL)
     if UA_MAP.exists():
         write_nick_map(records())
         reload_nginx()
+    if reactivate:
+        disabled.remove(name)
+        atomic_write(REVOKED, save_revoked(disabled), 0o600)
     show_link(name)
 
 
@@ -289,14 +304,27 @@ def rotate():
         changed[WS_CONFIG] = json.dumps(web_socket, ensure_ascii=False, indent=2) + "\n"
         changed[WS_PROFILE] = f"{domain}\t{port}\t{ws_ids[previous_id]}\t{path}\n"
 
+    apply_credentials(changed, rotated_tokens, retire_units=LEGACY_UNITS)
+    print(f"Заменено ключей Xray: {len(new_ids)}. Новых подписок: {len(users)}.")
+    for path in LEGACY_FILES:
+        path.unlink(missing_ok=True)
+    run("systemctl", "daemon-reload")
+    print("Telegram-прокси удалены, split отключён. HTTP-подписки слушают только localhost.")
+    if WS_CONFIG in changed:
+        print("Ключ WebSocket тоже заменён. Получить его: lastos-admin ws-link")
+
+
+def apply_credentials(changed, new_tokens, retire_units=()):
     units = ["xray"]
     if WS_CONFIG in changed and service_active("lastvn-ws"):
         units.append("lastvn-ws")
-    legacy_running = [unit for unit in LEGACY_UNITS if service_active(unit)]
+    legacy_running = [unit for unit in retire_units if service_active(unit)]
     before = snapshot([*changed, UA_MAP])
     sub = WEB / "sub"
     with tempfile.TemporaryDirectory(prefix=".lastos-", dir=WEB.parent) as directory:
         stage = Path(directory)
+        if STATE not in changed:
+            atomic_write(stage / STATE.name, STATE.read_bytes(), 0o600)
         for path, data in changed.items():
             staged = stage / ("ws.json" if path == WS_CONFIG else path.name)
             atomic_write(staged, data, 0o600)
@@ -313,7 +341,7 @@ rebuild_subs
         run("bash", "-c", render, "lastos-render", str(stage))
         staged_sub = stage / "web" / "sub"
         saved_sub = stage / "old-sub"
-        if not staged_sub.is_dir() or not all((staged_sub / token).is_file() for token in rotated_tokens.values()):
+        if not staged_sub.is_dir() or not all((staged_sub / token).is_file() for token in new_tokens.values()):
             raise ValueError("Не удалось подготовить новые подписки")
         try:
             for path, data in changed.items():
@@ -321,12 +349,12 @@ rebuild_subs
             sub.rename(saved_sub)
             staged_sub.rename(sub)
             if UA_MAP.exists():
-                write_nick_map(rotated_tokens)
+                write_nick_map(new_tokens)
                 reload_nginx()
             for service in units:
                 run("systemctl", "restart", service)
                 run("systemctl", "is-active", "--quiet", service)
-            for service in LEGACY_UNITS:
+            for service in retire_units:
                 check = subprocess.run(("systemctl", "show", "-P", "LoadState", service),
                                        check=False, capture_output=True, text=True)
                 if check.stdout.strip() == "loaded":
@@ -344,13 +372,67 @@ rebuild_subs
             for service in legacy_running:
                 subprocess.run(("systemctl", "enable", "--now", service), check=False)
             raise
-    print(f"Заменено ключей Xray: {len(new_ids)}. Новых подписок: {len(users)}.")
-    for path in LEGACY_FILES:
-        path.unlink(missing_ok=True)
-    run("systemctl", "daemon-reload")
-    print("Telegram-прокси удалены, split отключён. HTTP-подписки слушают только localhost.")
-    if WS_CONFIG in changed:
-        print("Ключ WebSocket тоже заменён. Получить его: lastos-admin ws-link")
+
+
+def remove_user(name, retain_nick):
+    users = records()
+    disabled = revoked_users()
+    if name not in users and name not in disabled:
+        raise ValueError("Ник не найден")
+    if retain_nick and name in disabled:
+        raise ValueError("Ключ уже отозван")
+    if retain_nick:
+        disabled.add(name)
+    else:
+        disabled.discard(name)
+    if name in users:
+        config = json.loads(XRAY.read_text())
+        ids = {
+            client["id"] for inbound in config["inbounds"] if inbound.get("protocol") == "vless"
+            for client in inbound.get("settings", {}).get("clients", [])
+            if client.get("email") == name
+        }
+        for inbound in config["inbounds"]:
+            settings = inbound.get("settings", {})
+            if inbound.get("protocol") == "vless" and "clients" in settings:
+                settings["clients"] = [
+                    client for client in settings["clients"]
+                    if client["id"] not in ids and client.get("email") != name
+                ]
+        del users[name]
+        changed = {
+            XRAY: json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            TOKENS: "".join(f"{nick} {token}\n" for nick, token in users.items()),
+            REVOKED: save_revoked(disabled),
+        }
+        if not retain_nick:
+            without_limit_route(config, name)
+            changed[XRAY] = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+        apply_credentials(changed, users)
+    else:
+        config = json.loads(XRAY.read_text())
+        if without_limit_route(config, name):
+            apply_credentials({
+                XRAY: json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                TOKENS: TOKENS.read_text(),
+                REVOKED: save_revoked(disabled),
+            }, users)
+        else:
+            atomic_write(REVOKED, save_revoked(disabled), 0o600)
+    if not retain_nick:
+        limiter = Path("/usr/local/sbin/lastos-limits")
+        if limiter.is_file():
+            run(str(limiter), "forget-deleted", name)
+    print(f"{name}: ключ и подписка отозваны." if retain_nick else f"{name}: пользователь удалён.")
+
+
+def without_limit_route(config, name):
+    tag = "lastos-limit-" + name
+    routing = config.get("routing", {})
+    before = len(routing.get("rules", []))
+    routing["rules"] = [rule for rule in routing.get("rules", []) if rule.get("outboundTag") != tag]
+    config["outbounds"] = [outbound for outbound in config["outbounds"] if outbound.get("tag") != tag]
+    return before != len(routing["rules"])
 
 
 def observed_agents():
@@ -370,7 +452,7 @@ def main():
     if os.geteuid() != 0:
         sys.exit("Запусти lastos-admin от root.")
     args = sys.argv[1:]
-    if args and args[0] in ("add", "link"):
+    if args and args[0] in ("add", "link", "revoke", "delete", "reissue"):
         if len(args) != 2 or not NICK.fullmatch(args[1]):
             sys.exit("Ник: 1–64 символа из A–Z, a–z, 0–9, _ . -")
     with open("/run/lock/lastos-admin.lock", "a") as lock:
@@ -379,6 +461,10 @@ def main():
             install()
         elif args == ["users"]:
             print("\n".join(records()))
+        elif args == ["users", "detailed"]:
+            users, disabled = records(), revoked_users()
+            for name in sorted(set(users) | disabled):
+                print(f"{name}\t{'active' if name in users else 'revoked'}")
         elif args == ["agents"]:
             observed_agents()
         elif args == ["ws-link"]:
@@ -387,10 +473,14 @@ def main():
             rotate()
         elif args and args[0] == "add":
             create_user(args[1])
+        elif args and args[0] == "reissue":
+            create_user(args[1], reactivate=True)
+        elif args and args[0] in ("revoke", "delete"):
+            remove_user(args[1], retain_nick=args[0] == "revoke")
         elif args and args[0] == "link":
             show_link(args[1])
         else:
-            sys.exit("Команды: install, users, add НИК, link НИК, ws-link, agents, rotate --confirm")
+            sys.exit("Команды: install, users, add НИК, link НИК, revoke НИК, reissue НИК, delete НИК, ws-link, agents, rotate --confirm")
 
 
 if __name__ == "__main__":
