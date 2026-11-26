@@ -217,9 +217,6 @@ class LastOS:
         if len(values) != 2 or not all(value.isascii() and value.isdecimal() for value in values):
             self.message = "Введи два целых числа через пробел."
             return
-        if self.prompt("Изменение лимитов перезапустит Xray", "Введи APPLY для применения") != "APPLY":
-            self.message = "Отменено."
-            return
         _, output = command(LIMITS, "set", name, *values, timeout=None)
         self.show_output(f"Лимиты · {name}", output)
 
