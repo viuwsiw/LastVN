@@ -39,6 +39,7 @@ NGINX = Path("/etc/nginx/conf.d/lastvn-ws.conf")
 UNIT = Path("/etc/systemd/system/lastvn-subscription.service")
 SOCKET = Path("/run/lastvn-subscription/http.sock")
 ROUTE = re.compile(r"/sub/([a-f0-9]{32})(-split)?")
+SUBSCRIPTION_APP = re.compile(r"\b(?:happ|incy)\b", re.IGNORECASE)
 GIB = 1024**3
 TRANSPORT_TAGS = ("lastvn-tcp", "lastvn-tls-ws", "lastvn-tls-grpc", "lastvn-hysteria")
 WS_LOCAL, GRPC_LOCAL = 16201, 16202
@@ -159,6 +160,25 @@ def counters(nick):
     return used, item.get("quota", 0), item.get("mbps", 0)
 
 
+def app_metadata(nick, used, quota, rate):
+    short_nick = nick if len(nick) <= 10 else nick[:9] + "…"
+    title = f"LastVN 🇳🇱 · {short_nick}"
+    traffic = f"{number(used / GIB)} ГиБ" if used is not None else "нет данных"
+    quota_label = f"{number(quota / GIB)} ГиБ" if quota else "безлимит"
+    speed_label = f"{rate} Мбит/с" if rate else "без ограничения"
+    notice = (
+        f"Ник · {nick}\nСкачано · {traffic}\n"
+        f"Лимит трафика · {quota_label}\nЛимит скорости · {speed_label}"
+    )
+    userinfo = "0" if used is None else f"upload=0; download={used}; total={quota}; expire=0"
+    return (
+        ("profile-title", "base64:" + base64.b64encode(title.encode()).decode("ascii")),
+        ("announce", "base64:" + base64.b64encode(notice[:200].encode()).decode("ascii")),
+        ("subscription-userinfo", userinfo),
+        ("profile-update-interval", "12"),
+    )
+
+
 def decoded_profiles(data):
     return base64.b64decode(data, validate=True).decode().splitlines()
 
@@ -228,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "private, no-store")
-        self.send_header("Vary", "Accept, Sec-Fetch-Mode")
+        self.send_header("Vary", "Accept, Sec-Fetch-Mode, User-Agent")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -269,9 +289,10 @@ class Handler(BaseHTTPRequestHandler):
                         (("Content-Disposition", 'attachment; filename="LastVN-Hysteria.json"'),))
             return
         manually = location.query == "format=profile"
+        app_request = SUBSCRIPTION_APP.search(self.headers.get("User-Agent", "")) is not None
         accept_html = "text/html" in self.headers.get("Accept", "")
         navigation = self.headers.get("Sec-Fetch-Mode", "") in ("", "navigate")
-        if not manually and accept_html and navigation:
+        if not manually and not app_request and accept_html and navigation:
             self.answer(200, card(nick, used, quota, rate, location.path, bool(settings)),
                         "text/html; charset=utf-8")
             return
@@ -280,11 +301,17 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, StopIteration, UnicodeError, binascii.Error):
             # Keep nonstandard legacy profiles importable.
             pass
-        title = "base64:" + base64.b64encode(NAME.encode()).decode()
-        headers = (
-            ("profile-title", title),
-            ("profile-update-interval", "12"),
-            ("subscription-userinfo", f"upload=0; download={used or 0}; total={quota}; expire=0"),
+        metadata = app_metadata(nick, used, quota, rate)
+        if app_request and not split:
+            try:
+                links = decoded_profiles(profile.strip())
+            except (ValueError, UnicodeError):
+                # Some older profiles cannot be safely decoded. Serve them as stored.
+                pass
+            else:
+                settings_lines = [f"#{name}: {value}" for name, value in metadata]
+                profile = ("\n".join(settings_lines + links) + "\n").encode()
+        headers = metadata + (
             ("x-lastvn-user", quote(nick, safe="")),
             ("x-lastvn-download-limit-mbps", str(rate)),
         )
