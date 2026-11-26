@@ -105,6 +105,9 @@ WantedBy=multi-user.target
 
 def compile_configs(config, limits, local_id=None):
     current_inbound = config["inbounds"][0]
+    profile_inbounds = [item["tag"] for item in config["inbounds"] if item.get("tag") in {
+        current_inbound["tag"], "lastvn-tcp", "lastvn-tls-ws", "lastvn-tls-grpc", "lastvn-hysteria",
+    }]
     old_routing = config.setdefault("routing", {}).setdefault("rules", [])
     old_routing[:] = [
         rule for rule in old_routing if not rule.get("outboundTag", "").startswith(PREFIX)
@@ -123,7 +126,7 @@ def compile_configs(config, limits, local_id=None):
             }]},
         })
         add_rules.append({
-            "type": "field", "user": [name], "inboundTag": [current_inbound["tag"]],
+            "type": "field", "user": [name], "inboundTag": profile_inbounds,
             "outboundTag": tag,
         })
     old_routing[:0] = add_rules
