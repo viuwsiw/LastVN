@@ -757,21 +757,49 @@ CERT_DIR="/etc/lastvn/cert"
 # Порт 80: ACME-проверка Let's Encrypt, редирект на https и (в режиме split)
 # приём XHTTP-выгрузки от Cloudflare Worker -> локальный XHTTP-инбаунд Xray.
 SPLIT_LOCAL_PORT=10000
-write_http80() {
-  local domain=$1 split_loc=""
-  local xpath; xpath=$(sed -n 's/^XHTTP_PATH=//p' "$STATE" 2>/dev/null || true)
-  if [[ -n $(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true) && -n $xpath ]]; then
-    split_loc="location ^~ $xpath {
+split_proxy_location() {
+  local xpath=$1
+  cat <<NGX
+    location ^~ $xpath {
         proxy_pass http://127.0.0.1:$SPLIT_LOCAL_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header Connection \"\";
+        proxy_set_header Connection "";
         proxy_request_buffering off;
         proxy_buffering off;
         client_max_body_size 0;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
-    }"
+    }
+NGX
+}
+
+install_split_tls_route() {
+  local xpath=$1 file=/etc/nginx/conf.d/lastvn-ws.conf
+  local route=/etc/nginx/lastvn-split-tls.inc previous
+  [[ -f $file ]] || die "сначала установи профиль lastvn-ws"
+  [[ $xpath =~ ^/[a-zA-Z0-9_-]+/$ ]] || die "некорректный XHTTP_PATH"
+  grep -qF 'location / { return 404; }' "$file" || die "неизвестный формат $file"
+  previous=$(mktemp)
+  cp -p "$file" "$previous"
+  split_proxy_location "$xpath" > "$route"
+  if ! grep -qF "include $route;" "$file"; then
+    sed -i "\|location / { return 404; }|i\    include $route;" "$file"
+  fi
+  if ! nginx -t; then
+    cp -p "$previous" "$file"
+    rm -f "$previous"
+    die "не прошла проверка конфигурации TLS"
+  fi
+  rm -f "$previous"
+}
+write_http80() {
+  local domain=$1 split_loc=""
+  local xpath; xpath=$(sed -n 's/^XHTTP_PATH=//p' "$STATE" 2>/dev/null || true)
+  if [[ -n $(sed -n 's/^SPLIT_PORT=//p' "$STATE" 2>/dev/null || true) && -n $xpath ]]; then
+    if ! grep -qxF "SPLIT_ORIGIN_TLS=1" "$STATE"; then
+      split_loc=$(split_proxy_location "$xpath")
+    fi
   fi
   mkdir -p /var/www/lastvn-acme
   cat > /etc/nginx/conf.d/lastvn-http.conf <<NGX
@@ -1031,6 +1059,22 @@ lab_generic() {
 cmd_split() {
   need_root; need_installed
   local arg=${1:-on}
+  if [[ $arg == tls ]]; then
+    local worker=${2:-} xpath target origin tls_port
+    [[ $worker =~ ^[a-z0-9][a-z0-9.-]*[.]workers[.]dev$ ]] || die "укажи имя воркера без https://"
+    target=$(jq -r '.inbounds[0].streamSettings.realitySettings.target' "$CONFIG")
+    [[ $target == 127.0.0.1:* ]] || die "сначала включи selfsteal"
+    xpath=$(sed -n 's/^XHTTP_PATH=//p' "$STATE")
+    [[ -r /etc/lastvn-ws/profile.tsv ]] || die "сначала установи профиль lastvn-ws"
+    IFS=$'	' read -r origin tls_port _ < /etc/lastvn-ws/profile.tsv
+    install_split_tls_route "$xpath/"
+    grep -qxF 'SPLIT_ORIGIN_TLS=1' "$STATE" || echo 'SPLIT_ORIGIN_TLS=1' >> "$STATE"
+    cmd_split 2083
+    cmd_split worker "$worker"
+    echo "Cloudflare ORIGIN: https://$origin:$tls_port"
+    echo "Cloudflare XHTTP_PATH: $xpath"
+    return
+  fi
   if [[ $arg == worker ]]; then
     local w=${2:-}; w=${w#https://}; w=${w%%/*}
     [[ $w == *.* ]] || die "укажи адрес воркера: $0 split worker имя.workers.dev"
@@ -1060,7 +1104,9 @@ cmd_split() {
   cmd_upgrade >/dev/null
   write_http80 "$SNI"
   green "Split включён: скачивание — Reality на порту $sp, выгрузка — через Cloudflare Worker -> порт 80."
-  echo "Origin для воркера: http://$SNI$XHTTP_PATH"
+  if ! grep -qxF 'SPLIT_ORIGIN_TLS=1' "$STATE"; then
+    echo "Origin для воркера: http://$SNI$XHTTP_PATH"
+  fi
 }
 
 # Самопроверка: клиент Xray на самом сервере ходит в свои же входы (без ТСПУ и чужих прокси)
