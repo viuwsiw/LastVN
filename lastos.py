@@ -164,15 +164,16 @@ class LastOS:
             self.user_scroll = self.user_selection
         if self.user_selection >= self.user_scroll + capacity:
             self.user_scroll = self.user_selection - capacity + 1
-        for index, name in enumerate(self.users[self.user_scroll:self.user_scroll + capacity]):
+        for index, (name, status) in enumerate(self.users[self.user_scroll:self.user_scroll + capacity]):
             selected = index + self.user_scroll == self.user_selection
-            self.put(index + 10, 2, f"{'> ' if selected else '  '}{name}",
+            suffix = " (ключ отозван)" if status == "revoked" else ""
+            self.put(index + 10, 2, f"{'> ' if selected else '  '}{name}{suffix}",
                      curses.A_REVERSE if selected else 0)
         if not self.users:
             self.put(10, 2, "Список пуст или недоступен.")
         self.put(height - 4, 2, self.message)
-        self.put(height - 3, 2, "↑↓ Выбор   Enter Показать ключ")
-        self.put(height - 2, 2, "A Создать   T Лимиты   Q Выход")
+        self.put(height - 3, 2, "Enter Ключ  K Отозвать/выпустить  X Удалить")
+        self.put(height - 2, 2, "↑↓ Выбор  A Создать  T Лимиты  Q Выход")
         self.screen.refresh()
 
     def draw_security(self, height):
@@ -200,8 +201,9 @@ class LastOS:
             self.screen.timeout(500)
 
     def refresh_users(self):
-        code, output = command(ADMIN, "users")
-        self.users = output.splitlines() if code == 0 and output else []
+        code, output = command(ADMIN, "users", "detailed")
+        self.users = [line.split("\t", 1) for line in output.splitlines()
+                      if "\t" in line] if code == 0 else []
         self.user_selection = min(self.user_selection, max(0, len(self.users) - 1))
         self.message = output if code else ""
 
@@ -228,11 +230,20 @@ class LastOS:
             elif key == curses.KEY_DOWN:
                 self.user_selection = min(max(0, len(self.users) - 1), self.user_selection + 1)
             elif key in (10, 13, curses.KEY_ENTER) and self.users:
-                name = self.users[self.user_selection]
+                name, status = self.users[self.user_selection]
+                if status == "revoked":
+                    self.message = "Ключ отозван. Нажми K, чтобы выпустить новый."
+                    return
                 _, output = command(ADMIN, "link", name)
                 self.show_output(f"Ключ · {name}", output)
             elif key in (ord("t"), ord("T")) and self.users:
-                self.edit_limits(self.users[self.user_selection])
+                name, status = self.users[self.user_selection]
+                if status == "active":
+                    self.edit_limits(name)
+                else:
+                    self.message = "Сначала выпусти новый ключ клавишей K."
+            elif key in (ord("k"), ord("K"), ord("x"), ord("X")) and self.users:
+                self.manage_credential(key)
             elif key in (ord("a"), ord("A")):
                 name = self.prompt("Новый пользователь", "Ник (латиница, цифры, _ . -)")
                 if name:
@@ -256,6 +267,21 @@ class LastOS:
                 self.show_output("Результат замены ключей", output)
             else:
                 self.message = "Отменено."
+
+    def manage_credential(self, key):
+        name, status = self.users[self.user_selection]
+        if key in (ord("x"), ord("X")):
+            verb, token, prompt = "delete", "DELETE", "Удалить пользователя"
+        elif status == "revoked":
+            verb, token, prompt = "reissue", "ISSUE", "Выпустить новый ключ"
+        else:
+            verb, token, prompt = "revoke", "REVOKE", "Отозвать ключ"
+        if self.prompt(f"{prompt} · {name}", f"Введи {token} для подтверждения") != token:
+            self.message = "Отменено."
+            return
+        _, output = command(ADMIN, verb, name, timeout=None)
+        self.show_output(f"{prompt} · {name}", output)
+        self.refresh_users()
 
     def show_output(self, title, output):
         lines = [
