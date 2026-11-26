@@ -26,6 +26,7 @@ STATUS_LABELS = {
     "not-found": "Не установлен",
 }
 ADMIN = "/usr/local/sbin/lastos-admin"
+LIMITS = "/usr/local/sbin/lastos-limits"
 
 
 def command(*args, timeout=4):
@@ -171,7 +172,7 @@ class LastOS:
             self.put(10, 2, "Список пуст или недоступен.")
         self.put(height - 4, 2, self.message)
         self.put(height - 3, 2, "↑↓ Выбор   Enter Показать ключ")
-        self.put(height - 2, 2, "A Создать пользователя   Q Выход")
+        self.put(height - 2, 2, "A Создать   T Лимиты   Q Выход")
         self.screen.refresh()
 
     def draw_security(self, height):
@@ -204,6 +205,22 @@ class LastOS:
         self.user_selection = min(self.user_selection, max(0, len(self.users) - 1))
         self.message = output if code else ""
 
+    def edit_limits(self, name):
+        _, output = command(LIMITS, "show", name)
+        self.show_output(f"Текущие лимиты · {name}", output)
+        values = self.prompt(f"Лимиты скачивания · {name}",
+                             "ГиБ Мбит/с (0 = безлимит, пусто = отмена)").split()
+        if not values:
+            return
+        if len(values) != 2 or not all(value.isascii() and value.isdecimal() for value in values):
+            self.message = "Введи два целых числа через пробел."
+            return
+        if self.prompt("Изменение лимитов перезапустит Xray", "Введи APPLY для применения") != "APPLY":
+            self.message = "Отменено."
+            return
+        _, output = command(LIMITS, "set", name, *values, timeout=None)
+        self.show_output(f"Лимиты · {name}", output)
+
     def admin_key(self, key):
         if self.panel == "users":
             if key == curses.KEY_UP:
@@ -214,12 +231,16 @@ class LastOS:
                 name = self.users[self.user_selection]
                 _, output = command(ADMIN, "link", name)
                 self.show_output(f"Ключ · {name}", output)
+            elif key in (ord("t"), ord("T")) and self.users:
+                self.edit_limits(self.users[self.user_selection])
             elif key in (ord("a"), ord("A")):
                 name = self.prompt("Новый пользователь", "Ник (латиница, цифры, _ . -)")
                 if name:
-                    _, output = command(ADMIN, "add", name, timeout=None)
+                    code, output = command(ADMIN, "add", name, timeout=None)
                     self.show_output("Результат создания пользователя", output)
                     self.refresh_users()
+                    if code == 0:
+                        self.edit_limits(name)
             return
         if key in (ord("a"), ord("A")):
             _, output = command(ADMIN, "agents")
