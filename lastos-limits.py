@@ -89,8 +89,6 @@ WantedBy=multi-user.target
 
 def compile_configs(config, limits):
     current_inbound = config["inbounds"][0]
-    clients = {client.get("email") for client in current_inbound["settings"]["clients"]}
-    applied = {name: item for name, item in limits.items() if name in clients}
     old_routing = config.setdefault("routing", {}).setdefault("rules", [])
     old_routing[:] = [
         rule for rule in old_routing if not rule.get("outboundTag", "").startswith(PREFIX)
@@ -99,7 +97,7 @@ def compile_configs(config, limits):
     outbounds[:] = [item for item in outbounds if not item.get("tag", "").startswith(PREFIX)]
     local_id = str(uuid.uuid4())
     add_rules = []
-    for name, item in applied.items():
+    for name, item in limits.items():
         tag = PREFIX + name
         outbounds.append({
             "tag": tag, "protocol": "vless",
@@ -127,7 +125,7 @@ def compile_configs(config, limits):
                       {"tag": "block", "protocol": "blackhole"}],
         "routing": {"domainStrategy": "IPOnDemand", "rules": block_rules},
     }
-    return as_json(config), as_json(gateway), as_json(applied)
+    return as_json(config), as_json(gateway), as_json(limits)
 
 
 def active():
@@ -229,6 +227,32 @@ def report(name):
     print(f"Квота скачивания: {quota // 1024**3} ГиБ" if quota else "Квота: безлимит")
     print(f"Скорость скачивания: {rate} Мбит/с" if rate else "Скорость: безлимит")
     print(f"Учтено скачивания: {saved_bytes(name) / 1024**3:.3f} ГиБ")
+
+
+def forget_deleted(name):
+    config = json.loads(CONFIG.read_text())
+    if any(client.get("email") == name for inbound in config["inbounds"]
+           for client in inbound.get("settings", {}).get("clients", [])):
+        raise ValueError("Сначала удали пользователя из Xray")
+    limits = world()
+    if name in limits:
+        previous = SETTINGS.read_bytes()
+        was_running = active()
+        del limits[name]
+        try:
+            write(SETTINGS, as_json(limits))
+            if was_running and limits:
+                run("systemctl", "restart", SERVICE)
+            elif was_running:
+                run("systemctl", "disable", "--now", SERVICE)
+        except BaseException:
+            write(SETTINGS, previous)
+            if was_running:
+                subprocess.run(("systemctl", "enable", "--now", SERVICE), check=False)
+            raise
+    if DB.exists():
+        with sqlite3.connect(DB) as db:
+            db.execute("DELETE FROM usage WHERE nick = ?", (name,))
 
 
 class Meter:
@@ -333,6 +357,8 @@ def main():
         install()
     elif len(arguments) == 2 and arguments[0] == "show":
         report(arguments[1])
+    elif len(arguments) == 2 and arguments[0] == "forget-deleted":
+        forget_deleted(arguments[1])
     elif len(arguments) == 4 and arguments[0] == "set":
         with open("/run/lock/lastos-admin.lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
