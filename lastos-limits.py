@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +22,8 @@ GATEWAY = Path("/etc/lastos-limits-egress.json")
 UNIT = Path("/etc/systemd/system/lastos-limits.service")
 DB = Path("/var/lib/lastos-limits/usage.db")
 SERVICE = "lastos-limits.service"
+LIVE = Path("/etc/lastos-limits-live")
+CONTROL = Path("/run/lastos-limits/control.sock")
 PREFIX = "lastos-limit-"
 GATEWAY_PORT = 16099
 PORT_BASE = 16100
@@ -35,10 +38,21 @@ def world():
     return json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
 
 
+def open_db(path, *, uri=False):
+    db = sqlite3.connect(path, uri=uri)
+    db.execute("PRAGMA trusted_schema=OFF")
+    return db
+
+
+def validate_nick(name):
+    if not NICK.fullmatch(name):
+        raise ValueError("Некорректный ник")
+
+
 def saved_bytes(name):
     if not DB.exists():
         return 0
-    with sqlite3.connect(f"file:{DB}?mode=ro", uri=True) as db:
+    with open_db(f"file:{DB}?mode=ro", uri=True) as db:
         row = db.execute("SELECT bytes FROM usage WHERE nick = ?", (name,)).fetchone()
         return row[0] if row else 0
 
@@ -74,6 +88,8 @@ Before=xray.service
 [Service]
 DynamicUser=true
 StateDirectory=lastos-limits
+RuntimeDirectory=lastos-limits
+RuntimeDirectoryMode=0700
 LoadCredential=settings.json:/etc/lastos-limits.json
 LoadCredential=egress.json:/etc/lastos-limits-egress.json
 Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray
@@ -87,7 +103,7 @@ WantedBy=multi-user.target
     run("systemctl", "daemon-reload")
 
 
-def compile_configs(config, limits):
+def compile_configs(config, limits, local_id=None):
     current_inbound = config["inbounds"][0]
     old_routing = config.setdefault("routing", {}).setdefault("rules", [])
     old_routing[:] = [
@@ -95,7 +111,7 @@ def compile_configs(config, limits):
     ]
     outbounds = config["outbounds"]
     outbounds[:] = [item for item in outbounds if not item.get("tag", "").startswith(PREFIX)]
-    local_id = str(uuid.uuid4())
+    local_id = local_id or str(uuid.uuid4())
     add_rules = []
     for name, item in limits.items():
         tag = PREFIX + name
@@ -144,42 +160,55 @@ def reserved_ports(limits):
 
 def ready_settings(expected):
     run("systemctl", "is-active", "--quiet", SERVICE)
-    if not reserved_ports(expected) <= local_ports():
+    if not CONTROL.exists() or not reserved_ports(expected) <= local_ports():
         raise ValueError("Локальный ограничитель не открыл все слушатели")
 
 
-def set_limit(name, quota, mbps):
-    quota, mbps = int(quota), int(mbps)
-    if not NICK.fullmatch(name) or not 0 <= quota <= 1_000_000 or not 0 <= mbps <= 10000:
-        raise ValueError("Лимиты: 0–1000000 ГиБ и 0–10000 Мбит/с. Ноль означает безлимит.")
+def next_port(limits):
+    used = {item["port"] for item in limits.values()} | local_ports()
+    port = next((port for port in range(PORT_BASE, PORT_BASE + 1000) if port not in used), None)
+    if port is None:
+        raise ValueError("Нет свободных внутренних портов для нового пользователя")
+    return port
+
+
+def prepare():
     config = json.loads(CONFIG.read_text())
-    if name not in {client.get("email") for client in config["inbounds"][0]["settings"]["clients"]}:
-        raise ValueError("Ник не найден в VLESS Direct")
     limits = world()
-    was_active = active()
-    existing_ports = reserved_ports(limits) if was_active else set()
-    if not quota and not mbps:
+    clients = config["inbounds"][0]["settings"]["clients"]
+    enrolled = {client["email"] for client in clients if client.get("email")}
+    if len(enrolled) != len(clients):
+        raise ValueError("Для учёта нужны уникальные ники у всех пользователей")
+    for name in enrolled:
+        validate_nick(name)
         if name not in limits:
-            report(name)
-            return
-        del limits[name]
-    else:
-        assigned = limits.get(name)
-        if assigned:
-            port = assigned["port"]
-        else:
-            used = {item["port"] for item in limits.values()}
-            port = next((port for port in range(PORT_BASE, PORT_BASE + 1000) if port not in used), None)
-            if port is None:
-                raise ValueError("Нет свободных внутренних портов для нового лимита")
-        limits[name] = {"quota": quota * 1024**3, "mbps": mbps, "port": port}
+            limits[name] = {"quota": 0, "mbps": 0, "port": next_port(limits)}
+        limits[name]["blocked"] = False
+    for name in set(limits) - enrolled:
+        limits[name]["blocked"] = True
+    if not limits:
+        raise ValueError("Сначала создай пользователя VLESS Direct")
+    routes = {rule.get("outboundTag") for rule in config.get("routing", {}).get("rules", [])}
+    if LIVE.exists() and CONTROL.exists() and active() and all(
+        PREFIX + name in routes for name in enrolled
+    ):
+        save_live(limits)
+        print("Режим реального времени уже включён.")
+        return
+    deploy_runtime(config, limits)
+    write(LIVE, b"1\n")
+    print("Режим реального времени включён.")
+
+
+def deploy_runtime(config, limits):
     if not UNIT.exists():
         raise ValueError("Сначала установи компонент лимитов: lastos-limits install")
 
+    was_active = active()
+    existing_ports = reserved_ports(world()) if was_active else set()
     main, gateway, applied = compile_configs(config, limits)
     checked_config(main)
-    if limits:
-        checked_config(gateway)
+    checked_config(gateway)
     before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
               for path in (CONFIG, SETTINGS, GATEWAY)}
     if (reserved_ports(json.loads(applied)) - existing_ports) & local_ports():
@@ -216,8 +245,77 @@ def set_limit(name, quota, mbps):
         if restarted_xray:
             subprocess.run(("systemctl", "restart", "xray"), check=False)
         raise
+
+
+
+def push_settings(limits):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as pipe:
+        pipe.settimeout(12)
+        pipe.connect(str(CONTROL))
+        pipe.sendall(as_json(limits) + b"\x00")
+        pipe.shutdown(socket.SHUT_WR)
+        with pipe.makefile("rb") as response:
+            status = response.readline().decode(errors="replace").strip()
+        if status != "OK":
+            raise ValueError(status or "Нет ответа от ограничителя")
+
+
+def save_live(limits):
+    if not LIVE.exists():
+        raise ValueError("Сначала включи режим реального времени: lastos-limits prepare")
+    undo = SETTINGS.read_bytes()
+    write(SETTINGS, as_json(limits))
+    try:
+        push_settings(limits)
+    except BaseException:
+        write(SETTINGS, undo)
+        try:
+            push_settings(json.loads(undo))
+        except (OSError, ValueError):
+            pass
+        raise
+
+
+def set_limit(name, quota, mbps):
+    validate_nick(name)
+    quota, mbps = int(quota), int(mbps)
+    if not 0 <= quota <= 1_000_000 or not 0 <= mbps <= 10000:
+        raise ValueError("Лимиты: 0–1000000 ГиБ и 0–10000 Мбит/с. Ноль означает безлимит.")
+    limits = world()
+    if name not in limits or limits[name].get("blocked"):
+        raise ValueError("Ник не активирован в режиме реального времени")
+    limits[name].update(quota=quota * 1024**3, mbps=mbps)
+    save_live(limits)
     report(name)
 
+
+def block_user(name, blocked):
+    limits = world()
+    if name not in limits:
+        raise ValueError("Ник не активирован в режиме реального времени")
+    limits[name]["blocked"] = blocked
+    save_live(limits)
+
+
+def enroll(name):
+    if not LIVE.exists():
+        return
+    limits = world()
+    if name not in limits:
+        limits[name] = {"quota": 0, "mbps": 0, "port": next_port(limits), "blocked": True}
+    gateway = json.loads(GATEWAY.read_text())
+    key = gateway["inbounds"][0]["settings"]["clients"][0]["id"]
+    config = json.loads(CONFIG.read_text())
+    main, _, _ = compile_configs(config, limits, key)
+    checked_config(main)
+    previous = CONFIG.read_bytes()
+    mode = CONFIG.stat().st_mode & 0o777
+    write(CONFIG, main, mode)
+    try:
+        save_live(limits)
+    except BaseException:
+        write(CONFIG, previous, mode)
+        raise
 
 def report(name):
     limit = world().get(name, {})
@@ -230,40 +328,65 @@ def report(name):
 
 
 def forget_deleted(name):
+    validate_nick(name)
     config = json.loads(CONFIG.read_text())
     if any(client.get("email") == name for inbound in config["inbounds"]
            for client in inbound.get("settings", {}).get("clients", [])):
         raise ValueError("Сначала удали пользователя из Xray")
     limits = world()
-    if name in limits:
-        previous = SETTINGS.read_bytes()
-        was_running = active()
-        del limits[name]
-        try:
+    if name in limits and LIVE.exists():
+        # The live Xray may still refer to this port. Never reuse it before a restart.
+        limits[name].update(quota=0, mbps=0, blocked=True, reset_usage=True)
+        save_live(limits)
+        limits[name].pop("reset_usage")
+        write(SETTINGS, as_json(limits))
+    else:
+        if name in limits:
+            del limits[name]
             write(SETTINGS, as_json(limits))
-            if was_running and limits:
-                run("systemctl", "restart", SERVICE)
-            elif was_running:
-                run("systemctl", "disable", "--now", SERVICE)
-        except BaseException:
-            write(SETTINGS, previous)
-            if was_running:
-                subprocess.run(("systemctl", "enable", "--now", SERVICE), check=False)
-            raise
-    if DB.exists():
-        with sqlite3.connect(DB) as db:
+            if active():
+                if limits:
+                    run("systemctl", "restart", SERVICE)
+                else:
+                    run("systemctl", "disable", "--now", SERVICE)
+    if DB.exists() and (not LIVE.exists() or name not in limits):
+        with open_db(DB) as db:
             db.execute("DELETE FROM usage WHERE nick = ?", (name,))
 
 
 class Meter:
     def __init__(self, name, settings, db):
         self.name = name
-        self.quota = settings["quota"]
-        self.rate = settings["mbps"] * 1_000_000 / 8
+        self.connections = set()
+        self.policy_changed = asyncio.Event()
         self.db = db
         row = db.execute("SELECT bytes FROM usage WHERE nick = ?", (name,)).fetchone()
         self.used = row[0] if row else 0
+        self.saved = self.used
         self.lock = asyncio.Lock()
+        self.apply(settings)
+
+    def apply(self, settings):
+        self.quota = settings["quota"]
+        self.rate = settings["mbps"] * 1_000_000 / 8
+        self.blocked = settings.get("blocked", False)
+        self.policy_changed.set()
+        if self.blocked:
+            for task in self.connections:
+                task.cancel()
+        if settings.get("reset_usage"):
+            self.used = self.saved = 0
+            self.db.execute("DELETE FROM usage WHERE nick = ?", (self.name,))
+            self.db.commit()
+
+    def flush(self):
+        if self.used != self.saved:
+            self.db.execute(
+                "INSERT INTO usage VALUES (?, ?) ON CONFLICT(nick) DO UPDATE SET bytes=excluded.bytes",
+                (self.name, self.used),
+            )
+            self.db.commit()
+            self.saved = self.used
 
     async def download(self, reader, writer):
         while True:
@@ -271,18 +394,24 @@ class Meter:
             if not chunk:
                 return
             async with self.lock:
-                if self.quota:
-                    chunk = chunk[:max(0, self.quota - self.used)]
-                if not chunk:
-                    return
-                if self.rate:
-                    await asyncio.sleep(len(chunk) / self.rate)
+                while True:
+                    if self.quota:
+                        allowed = chunk[:max(0, self.quota - self.used)]
+                    else:
+                        allowed = chunk
+                    if not allowed or self.blocked:
+                        return
+                    if not self.rate:
+                        break
+                    self.policy_changed.clear()
+                    try:
+                        await asyncio.wait_for(self.policy_changed.wait(), len(allowed) / self.rate)
+                    except asyncio.TimeoutError:
+                        break
+                chunk = allowed
                 self.used += len(chunk)
-                self.db.execute(
-                    "INSERT INTO usage VALUES (?, ?) ON CONFLICT(nick) DO UPDATE SET bytes=excluded.bytes",
-                    (self.name, self.used),
-                )
-                self.db.commit()
+                if self.quota or self.used - self.saved >= 1024**2:
+                    self.flush()
                 writer.write(chunk)
             await writer.drain()
             if self.quota and self.used >= self.quota:
@@ -291,8 +420,10 @@ class Meter:
     async def connection(self, reader, writer):
         remote_writer = None
         tasks = []
+        task = asyncio.current_task()
+        self.connections.add(task)
         try:
-            if self.quota and self.used >= self.quota:
+            if self.blocked or (self.quota and self.used >= self.quota):
                 return
             remote_reader, remote_writer = await asyncio.open_connection("127.0.0.1", GATEWAY_PORT)
             tasks = [
@@ -308,12 +439,14 @@ class Meter:
         except (ConnectionError, OSError):
             pass
         finally:
-            for task in tasks:
-                task.cancel()
+            self.connections.discard(task)
+            for pipe in tasks:
+                pipe.cancel()
             for stream in (remote_writer, writer):
                 if stream:
                     stream.close()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.flush()
 
 
 async def copy_upload(reader, writer):
@@ -327,19 +460,63 @@ async def serve():
     folder = Path(os.environ["CREDENTIALS_DIRECTORY"])
     limits = json.loads((folder / "settings.json").read_text())
     db_path = Path(os.environ["STATE_DIRECTORY"]) / "usage.db"
-    with sqlite3.connect(db_path) as db:
+    control_path = Path(os.environ["RUNTIME_DIRECTORY"]) / "control.sock"
+    with open_db(db_path) as db:
         db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
         db.execute("CREATE TABLE IF NOT EXISTS usage (nick TEXT PRIMARY KEY, bytes INTEGER NOT NULL)")
         gateway = await asyncio.create_subprocess_exec(XRAY, "run", "-c", str(folder / "egress.json"))
-        listeners = []
+        listeners = {}
+
+        async def reconcile(updated):
+            new = {}
+            try:
+                for name, settings in updated.items():
+                    validate_nick(name)
+                    if name in listeners:
+                        if settings["port"] != listeners[name][2]:
+                            raise ValueError("Нельзя изменить активный внутренний порт")
+                        continue
+                    meter = Meter(name, settings, db)
+                    listener = await asyncio.start_server(meter.connection, "127.0.0.1", settings["port"])
+                    new[name] = (listener, meter, settings["port"])
+            except BaseException:
+                for listener, _, _ in new.values():
+                    listener.close()
+                    await listener.wait_closed()
+                raise
+            listeners.update(new)
+            for name, (_, meter, _) in listeners.items():
+                meter.apply(updated.get(name, {"quota": 0, "mbps": 0, "blocked": True}))
+
+        async def control(reader, writer):
+            try:
+                raw = await asyncio.wait_for(reader.readuntil(b"\x00"), 10)
+                async with lock:
+                    await reconcile(json.loads(raw[:-1]))
+                writer.write(b"OK\n")
+            except (OSError, ValueError, KeyError, asyncio.LimitOverrunError,
+                    asyncio.IncompleteReadError, TimeoutError) as error:
+                writer.write((str(error) + "\n").encode())
+            finally:
+                try:
+                    await writer.drain()
+                finally:
+                    writer.close()
+
+        lock = asyncio.Lock()
+        server = None
         try:
-            for name, item in limits.items():
-                meter = Meter(name, item, db)
-                listeners.append(await asyncio.start_server(meter.connection, "127.0.0.1", item["port"]))
+            await reconcile(limits)
+            control_path.unlink(missing_ok=True)
+            server = await asyncio.start_unix_server(control, str(control_path), limit=200000)
             status = await gateway.wait()
             raise RuntimeError(f"Внутренний Xray завершился с кодом {status}")
         finally:
-            for listener in listeners:
+            if server:
+                server.close()
+                await server.wait_closed()
+            for listener, _, _ in listeners.values():
                 listener.close()
                 await listener.wait_closed()
             if gateway.returncode is None:
@@ -355,8 +532,19 @@ def main():
         sys.exit("Запусти lastos-limits от root")
     elif arguments == ["install"]:
         install()
+    elif arguments == ["prepare"]:
+        with open("/run/lock/lastos-admin.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            prepare()
     elif len(arguments) == 2 and arguments[0] == "show":
+        validate_nick(arguments[1])
         report(arguments[1])
+    elif len(arguments) == 2 and arguments[0] in ("block", "unblock", "enroll"):
+        validate_nick(arguments[1])
+        if arguments[0] == "enroll":
+            enroll(arguments[1])
+        else:
+            block_user(arguments[1], arguments[0] == "block")
     elif len(arguments) == 2 and arguments[0] == "forget-deleted":
         forget_deleted(arguments[1])
     elif len(arguments) == 4 and arguments[0] == "set":
