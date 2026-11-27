@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Administrative actions for LastOS on a LastVN VPS."""
 
+from base64 import b64encode
 import fcntl
 import json
 import os
@@ -19,12 +20,14 @@ REVOKED = Path("/etc/lastos-revoked.json")
 LIVE_LIMITS = Path("/etc/lastos-limits-live")
 LIMITER = Path("/usr/local/sbin/lastos-limits")
 WEB = Path("/var/www/lastvn")
+LANDING = WEB / "landing.html"
 WS_CONFIG = Path("/etc/lastvn-ws/config.json")
 WS_PROFILE = WS_CONFIG.with_name("profile.tsv")
 NGINX = Path("/etc/nginx/conf.d")
 SUB_NGINX = NGINX / "lastvn.conf"
 WS_NGINX = NGINX / "lastvn-ws.conf"
 HTTP_NGINX = NGINX / "lastvn-http.conf"
+SELFSTEAL_NGINX = NGINX / "lastvn-selfsteal.conf"
 UA_MAP = Path("/etc/nginx/lastos-users.map")
 UA_LOG = Path("/var/log/nginx/lastos-subscriptions.log")
 VNC_PROFILE = Path("/etc/profile.d/lastos-vnc.sh")
@@ -92,17 +95,30 @@ def reload_nginx():
     run("systemctl", "reload", "nginx")
 
 
-def root_response():
+def root_response(landing=False):
+    if landing:
+        return (
+            f"    location = / {{ root {LANDING.parent}; try_files /{LANDING.name} =404; "
+            "default_type text/html; charset utf-8; }"
+        )
     return f'    location = / {{ default_type text/plain; charset utf-8; return 200 "{MESSAGE}"; }}'
 
 
-def add_root_response(config):
-    if MESSAGE in config:
+def add_root_response(config, *, landing=False):
+    response = root_response(landing)
+    if response in config or (not landing and (MESSAGE in config or root_response(True) in config)):
         return config
+    if landing:
+        old_roots = (root_response(), "    location = / { try_files /index.html =404; }")
+        old_root = next((block for block in old_roots if config.count(block) == 1), None)
+        if old_root:
+            return config.replace(old_root, response, 1)
+        if re.search(r"(?m)^[ \t]*location\s+=\s*/\s*\{", config):
+            raise ValueError("В конфигурации уже есть другой обработчик главной страницы")
     marker = "    location / {"
     if config.count(marker) != 1:
         raise ValueError("Не найдено однозначное место для главной страницы nginx")
-    return config.replace(marker, root_response() + "\n" + marker, 1)
+    return config.replace(marker, response + "\n" + marker, 1)
 
 
 def restore_files(files):
@@ -115,6 +131,41 @@ def restore_files(files):
 
 def snapshot(paths):
     return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def install_landing(source):
+    html = source.read_text(encoding="utf-8")
+    for image, mime in (("../assets/logo.png", "image/png"), ("netherlands.webp", "image/webp")):
+        reference = f'src="{image}"'
+        if html.count(reference) != 1:
+            raise ValueError(f"На странице не найдена ссылка на {image}")
+        encoded = b64encode((source.parent / image).read_bytes()).decode("ascii")
+        html = html.replace(reference, f'src="data:{mime};base64,{encoded}"')
+
+    changes = {LANDING: html}
+    for config in (WS_NGINX, HTTP_NGINX, SELFSTEAL_NGINX, SUB_NGINX):
+        if not config.is_file():
+            continue
+        original = config.read_text()
+        try:
+            updated = add_root_response(original, landing=True)
+        except ValueError as error:
+            raise ValueError(f"{config.name}: {error}") from error
+        if updated != original:
+            changes[config] = updated
+    if not WS_NGINX.is_file():
+        raise ValueError("Не найден существующий HTTPS-сайт LastVN")
+
+    previous = snapshot(changes)
+    try:
+        for path, content in changes.items():
+            atomic_write(path, content, 0o644)
+        reload_nginx()
+    except BaseException:
+        restore_files(previous)
+        reload_nginx()
+        raise
+    print("Главная страница LastVN установлена.")
 
 
 def install():
@@ -145,10 +196,11 @@ def install():
             f'<title>LastVN</title><p>{MESSAGE}</p></html>\n'
         ),
     }
+    landing = LANDING.is_file()
     if HTTP_NGINX.exists():
-        changes[HTTP_NGINX] = add_root_response(HTTP_NGINX.read_text())
+        changes[HTTP_NGINX] = add_root_response(HTTP_NGINX.read_text(), landing=landing)
     if WS_NGINX.exists():
-        config = add_root_response(WS_NGINX.read_text())
+        config = add_root_response(WS_NGINX.read_text(), landing=landing)
         marker = "    location ^~ /sub/ {"
         if marker not in config:
             route = (
@@ -472,6 +524,8 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args == ["install"]:
             install()
+        elif len(args) == 2 and args[0] == "install-landing":
+            install_landing(Path(args[1]))
         elif args == ["users"]:
             print("\n".join(records()))
         elif args == ["users", "detailed"]:
@@ -493,7 +547,7 @@ def main():
         elif args and args[0] == "link":
             show_link(args[1])
         else:
-            sys.exit("Команды: install, users, add НИК, link НИК, revoke НИК, reissue НИК, delete НИК, ws-link, agents, rotate --confirm")
+            sys.exit("Команды: install, install-landing ПУТЬ, users, add НИК, link НИК, revoke НИК, reissue НИК, delete НИК, ws-link, agents, rotate --confirm")
 
 
 if __name__ == "__main__":
