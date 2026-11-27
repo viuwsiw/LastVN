@@ -31,6 +31,7 @@ except ModuleNotFoundError as error:
     split_profile = None
 
 NAME = "LastVN: первый, нидерландский 🇳🇱"
+SPLIT_LABEL = "🇷🇺 Split-up"
 TOKENS = Path("/usr/local/etc/xray/lastvn.tokens")
 PROFILES = Path("/var/www/lastvn/sub")
 POLICY = Path("/etc/lastos-limits.json")
@@ -111,7 +112,7 @@ def card(nick, used, quota, rate, route, has_transports=False, *, uploaded=None,
     quota_label = f"{number(quota / GIB)} ГиБ" if quota else "Безлимит"
     speed_label = f"{rate} Мбит/с" if rate else "Без ограничения"
     upload_line = f'<p class="small">Отправлено {number(uploaded / GIB)} ГиБ</p>' if uploaded is not None else ""
-    split_button = ('<button type="button" data-format="ru-nl">Скопировать RU → NL</button>'
+    split_button = (f'<button type="button" data-format="ru-nl">Скопировать {SPLIT_LABEL}</button>'
                     if has_ru_split else "")
     if quota and used is not None:
         proportion = max(0, min(100, int(used * 100 / quota)))
@@ -185,8 +186,7 @@ def counters(nick):
 
 def app_metadata(nick, used, quota, rate, *, uploaded=None, ru_split=False):
     short_nick = nick if len(nick) <= 10 else nick[:9] + "…"
-    name = "LastVN RU–NL" if ru_split else "LastVN 🇳🇱"
-    title = f"{name} · {short_nick}"
+    title = f"LastVN {SPLIT_LABEL}" if ru_split else f"LastVN 🇳🇱 · {short_nick}"
     traffic = f"{number(used / GIB)} ГиБ" if used is not None else "нет данных"
     quota_label = f"{number(quota / GIB)} ГиБ" if quota else "безлимит"
     speed_label = f"{rate} Мбит/с" if rate else "без ограничения"

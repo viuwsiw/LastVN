@@ -74,7 +74,7 @@ def split_profile(direct_link, ru_address, ru_port):
     downlink.update(address=str(nl_address), port=link.port or 443)
     xhttp.setdefault("extra", {})["downloadSettings"] = downlink
     return {
-        "remarks": "LastVN · RU → NL",
+        "remarks": "LastVN: первый, нидерландский 🇳🇱 · 🇷🇺 Split-up",
         "log": {"loglevel": "warning"},
         "inbounds": [{
             "tag": "socks",
