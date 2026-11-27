@@ -294,6 +294,16 @@ def set_limit(name, quota, mbps):
     report(name)
 
 
+def unlimit_speed():
+    limits = world()
+    changed = [item for item in limits.values() if item.get("mbps", 0)]
+    if changed:
+        for item in changed:
+            item["mbps"] = 0
+        save_live(limits)
+    print(f"Снято ограничений скорости: {len(changed)}")
+
+
 def block_user(name, blocked):
     limits = world()
     if name not in limits:
@@ -429,7 +439,7 @@ class Meter:
                         break
                 chunk = allowed
                 self.used += len(chunk)
-                if self.quota or self.used - self.saved >= 1024**2:
+                if self.quota and self.used == self.quota:
                     flush_usage(self.db, (self,))
                 writer.write(chunk)
             await writer.drain()
@@ -451,8 +461,8 @@ class Meter:
             ]
             # A client may finish sending before the remote finishes replying.
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
+            for pipe in done:
+                pipe.result()
             if tasks[0] not in done:
                 await tasks[0]
         except (ConnectionError, OSError):
@@ -465,7 +475,6 @@ class Meter:
                 if stream:
                     stream.close()
             await asyncio.gather(*tasks, return_exceptions=True)
-            flush_usage(self.db, (self,))
 
     async def upload(self, reader, writer):
         while chunk := await reader.read(65536):
@@ -579,10 +588,13 @@ def main():
         sys.exit("Запусти lastos-limits от root")
     elif arguments == ["install"]:
         install()
-    elif arguments == ["prepare"]:
+    elif arguments in (["prepare"], ["unlimit-speed"]):
         with open("/run/lock/lastos-admin.lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            prepare()
+            if arguments == ["prepare"]:
+                prepare()
+            else:
+                unlimit_speed()
     elif len(arguments) == 2 and arguments[0] == "show":
         validate_nick(arguments[1])
         report(arguments[1])
@@ -599,7 +611,7 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX)
             set_limit(*arguments[1:])
     else:
-        sys.exit("Использование: lastos-limits show НИК | set НИК ГиБ Мбит/с")
+        sys.exit("Использование: lastos-limits show НИК | set НИК ГиБ Мбит/с | unlimit-speed")
 
 
 if __name__ == "__main__":

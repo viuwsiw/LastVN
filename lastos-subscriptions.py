@@ -31,7 +31,8 @@ except ModuleNotFoundError as error:
     split_profile = None
 
 NAME = "LastVN: первый, нидерландский 🇳🇱"
-SPLIT_LABEL = "🇷🇺 Split-up"
+SPLIT_LABEL = "LastVN | Split"
+REALITY_LABEL = "LastVN | VLESS + Reality"
 TOKENS = Path("/usr/local/etc/xray/lastvn.tokens")
 PROFILES = Path("/var/www/lastvn/sub")
 POLICY = Path("/etc/lastos-limits.json")
@@ -186,7 +187,7 @@ def counters(nick):
 
 def app_metadata(nick, used, quota, rate, *, uploaded=None, ru_split=False):
     short_nick = nick if len(nick) <= 10 else nick[:9] + "…"
-    title = f"LastVN {SPLIT_LABEL}" if ru_split else f"LastVN 🇳🇱 · {short_nick}"
+    title = SPLIT_LABEL if ru_split else f"LastVN 🇳🇱 · {short_nick}"
     traffic = f"{number(used / GIB)} ГиБ" if used is not None else "нет данных"
     quota_label = f"{number(quota / GIB)} ГиБ" if quota else "безлимит"
     speed_label = f"{rate} Мбит/с" if rate else "без ограничения"
@@ -241,19 +242,19 @@ def transport_links(user, settings):
     reality = {name: direct[name][0] for name in ("sni", "fp", "pbk", "sid")}
     tls = {"security": "tls", "sni": settings["hostname"]}
     for address, port, parameters, label in (
-        (user.hostname, settings["raw_port"], {"security": "reality", "type": "tcp", **reality}, "TCP"),
+        (user.hostname, settings["raw_port"], {"security": "reality", "type": "tcp", **reality}, "TCP + Reality"),
         (settings["hostname"], settings["tls_port"], {**tls, "type": "ws",
              "host": settings["hostname"], "path": settings["path"]}, "WS"),
         (settings["hostname"], settings["tls_port"], {**tls, "type": "grpc",
              "alpn": "h2", "serviceName": settings["grpc"]}, "gRPC"),
     ):
         query = urlencode({"encryption": "none", **parameters}, quote_via=quote)
-        yield f"vless://{user.username}@{address}:{port}?{query}#{quote(NAME + ' · ' + label, safe='')}"
+        yield f"vless://{user.username}@{address}:{port}?{query}#{quote('LastVN | ' + label, safe='')}"
 
 
 def hysteria_profile(user, settings):
     return json.dumps({
-        "remarks": NAME + " · Hysteria",
+        "remarks": "LastVN | Hysteria",
         "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
                       "settings": {"udp": True}}],
         "outbounds": [{
@@ -274,10 +275,10 @@ def hysteria_profile(user, settings):
 def branded_profile(data, split, settings):
     if split:
         document = json.loads(data)
-        document["remarks"] = NAME
+        document["remarks"] = SPLIT_LABEL
         return json.dumps(document, ensure_ascii=False).encode()
     renamed = [
-        line.split("#", 1)[0] + "#" + quote(NAME, safe="") if line.startswith("vless://") else line
+        line.split("#", 1)[0] + "#" + quote(REALITY_LABEL, safe="") if line.startswith("vless://") else line
         for line in decoded_profiles(data)
     ]
     if settings:
@@ -370,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, StopIteration, UnicodeError, binascii.Error):
             # Keep nonstandard legacy profiles importable.
             pass
-        metadata = app_metadata(nick, used, quota, rate, uploaded=uploaded)
+        metadata = app_metadata(nick, used, quota, rate, uploaded=uploaded, ru_split=bool(split))
         if app_request and not split:
             try:
                 links = decoded_profiles(profile.strip())

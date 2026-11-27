@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from urllib.parse import quote
 
 XRAY = Path("/usr/local/etc/xray/config.json")
 TOKENS = XRAY.with_name("lastvn.tokens")
@@ -252,7 +253,7 @@ def show_link(name):
     output = run(LASTVN, "link", name, stdout=subprocess.PIPE).stdout
     for line in output.splitlines():
         if line.strip().startswith("vless://"):
-            print(line.strip())
+            print(line.strip().partition("#")[0] + "#" + quote("LastVN | VLESS + Reality", safe=""))
     if WS_PROFILE.exists() and WS_NGINX.exists() and log_directive() in WS_NGINX.read_text():
         host, port, *_ = WS_PROFILE.read_text().strip().split("\t")
         print(f"https://{host}:{port}/sub/{records()[name]}")
@@ -287,10 +288,9 @@ def create_user(name, reactivate=False):
 
 
 def ws_link():
-    from urllib.parse import quote
     domain, port, secret, path = WS_PROFILE.read_text().strip().split("\t")
     print(f"vless://{secret}@{domain}:{port}?encryption=none&security=tls"
-          f"&sni={domain}&type=ws&host={domain}&path={quote(path, safe='')}#LastVN-WS")
+          f"&sni={domain}&type=ws&host={domain}&path={quote(path, safe='')}#LastVN%20%7C%20WS")
 
 
 def retire_unused_ingress(config):
