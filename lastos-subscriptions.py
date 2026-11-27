@@ -3,11 +3,13 @@
 
 import base64
 import binascii
+from contextlib import closing
 from copy import deepcopy
 import fcntl
 import grp
 from html import escape
 from http.server import BaseHTTPRequestHandler
+from ipaddress import IPv4Address
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,13 @@ import tempfile
 import time
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
+try:
+    from lastvn_aeza_split import split_profile
+except ModuleNotFoundError as error:
+    if error.name != "lastvn_aeza_split":
+        raise
+    split_profile = None
+
 NAME = "LastVN: первый, нидерландский 🇳🇱"
 TOKENS = Path("/usr/local/etc/xray/lastvn.tokens")
 PROFILES = Path("/var/www/lastvn/sub")
@@ -28,6 +37,7 @@ POLICY = Path("/etc/lastos-limits.json")
 LIVE = Path("/etc/lastos-limits-live")
 USAGE = Path("/var/lib/lastos-limits/usage.db")
 TRANSPORTS = Path("/etc/lastos-transports.json")
+RU_RELAY = Path("/etc/lastvn-aeza-relay")
 XRAY_CONFIG = Path("/usr/local/etc/xray/config.json")
 XRAY = "/usr/local/bin/xray"
 XRAY_DROPIN = Path("/etc/systemd/system/xray.service.d/99-lastvn-transports.conf")
@@ -70,23 +80,25 @@ button,a{display:inline-block;border-radius:12px;padding:10px 16px;font:inherit;
 button{appearance:none;border:0;background:var(--accent);color:#101c16;cursor:pointer}
 a{color:var(--ink);border:1px solid var(--line)}
 button:focus-visible,a:focus-visible{outline:3px solid #e3fff0;outline-offset:3px}
-#notice{min-height:21px;margin-top:10px}
+#notice{min-height:21px;margin-top:10px;overflow-wrap:anywhere}
 @media(max-width:430px){body{padding:26px 16px}.metrics{grid-template-columns:1fr}header{margin-bottom:24px}}
 """
 SCRIPT = """
-const button = document.querySelector('button');
 const notice = document.querySelector('#notice');
-button.addEventListener('click', async () => {
-  try {
+for (const button of document.querySelectorAll('button[data-format]')) {
+  button.addEventListener('click', async () => {
     const url = new URL(location.href);
     url.search = '';
     url.hash = '';
-    await navigator.clipboard.writeText(url.href);
-    notice.textContent = 'Ссылка скопирована';
-  } catch (_) {
-    notice.textContent = 'Скопируй ссылку из адресной строки';
-  }
-});
+    if (button.dataset.format) url.searchParams.set('format', button.dataset.format);
+    try {
+      await navigator.clipboard.writeText(url.href);
+      notice.textContent = 'Ссылка скопирована';
+    } catch (_) {
+      notice.textContent = url.href;
+    }
+  });
+}
 """
 
 
@@ -94,10 +106,13 @@ def number(value):
     return f"{value:,.2f}".replace(",", " ").replace(".", ",")
 
 
-def card(nick, used, quota, rate, route, has_transports=False):
+def card(nick, used, quota, rate, route, has_transports=False, *, uploaded=None, has_ru_split=False):
     traffic = f"{number(used / GIB)} ГиБ" if used is not None else "Нет данных"
     quota_label = f"{number(quota / GIB)} ГиБ" if quota else "Безлимит"
     speed_label = f"{rate} Мбит/с" if rate else "Без ограничения"
+    upload_line = f'<p class="small">Отправлено {number(uploaded / GIB)} ГиБ</p>' if uploaded is not None else ""
+    split_button = ('<button type="button" data-format="ru-nl">Скопировать RU → NL</button>'
+                    if has_ru_split else "")
     if quota and used is not None:
         proportion = max(0, min(100, int(used * 100 / quota)))
         usage_detail = ("Квота исчерпана" if used >= quota
@@ -121,10 +136,11 @@ def card(nick, used, quota, rate, route, has_transports=False):
 <header><h1><span class="brand">LastVN</span>: {escape(NAME.partition(': ')[2])}</h1>
 <p class="account">Пользователь <strong>{escape(nick)}</strong></p></header>
 <section class="card" aria-labelledby="download"><h2 id="download">Скачано</h2><p class="usage">{traffic}</p>
-{usage_bar}<p class="small">{usage_detail}</p></section>
+{usage_bar}<p class="small">{usage_detail}</p>{upload_line}</section>
 <div class="metrics"><section class="metric"><h2>Квота скачивания</h2><p>{quota_label}</p></section>
 <section class="metric"><h2>Скорость скачивания</h2><p>{speed_label}</p></section></div>
-<div class="actions"><button type="button">Скопировать подписку</button>
+<div class="actions"><button type="button" data-format="">Скопировать подписку</button>
+{split_button}
 <a href="{escape(route, quote=True)}?format=profile">Открыть профиль</a></div>
 <p id="notice" class="small" role="status"></p>
 {transports}
@@ -147,35 +163,48 @@ def counters(nick):
         item = json.loads(POLICY.read_text()).get(nick, {})
     except (OSError, ValueError):
         pass
-    used = 0 if LIVE.exists() and item and not item.get("blocked") else None
+    tracked = LIVE.exists() and bool(item) and not item.get("blocked")
+    used = 0 if tracked else None
+    uploaded = None
     if USAGE.is_file():
         try:
-            with sqlite3.connect(f"file:{USAGE}?mode=ro", uri=True, timeout=0.4) as db:
+            with closing(sqlite3.connect(f"file:{USAGE}?mode=ro", uri=True, timeout=0.4)) as db:
                 db.execute("PRAGMA trusted_schema=OFF")
+                db.execute("BEGIN")
                 row = db.execute("SELECT bytes FROM usage WHERE nick = ?", (nick,)).fetchone()
-            if row:
-                used = row[0]
+                if row:
+                    used = row[0]
+                if db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'usage_upload' AND type = 'table'").fetchone():
+                    upload = db.execute("SELECT bytes FROM usage_upload WHERE nick = ?", (nick,)).fetchone()
+                    uploaded = upload[0] if upload else (0 if tracked else None)
         except sqlite3.Error:
             used = None
-    return used, item.get("quota", 0), item.get("mbps", 0)
+            uploaded = None
+    return used, uploaded, item.get("quota", 0), item.get("mbps", 0)
 
 
-def app_metadata(nick, used, quota, rate):
+def app_metadata(nick, used, quota, rate, *, uploaded=None, ru_split=False):
     short_nick = nick if len(nick) <= 10 else nick[:9] + "…"
-    title = f"LastVN 🇳🇱 · {short_nick}"
+    name = "LastVN RU–NL" if ru_split else "LastVN 🇳🇱"
+    title = f"{name} · {short_nick}"
     traffic = f"{number(used / GIB)} ГиБ" if used is not None else "нет данных"
     quota_label = f"{number(quota / GIB)} ГиБ" if quota else "безлимит"
     speed_label = f"{rate} Мбит/с" if rate else "без ограничения"
-    notice = (
-        f"Ник · {nick}\nСкачано · {traffic}\n"
-        f"Лимит трафика · {quota_label}\nЛимит скорости · {speed_label}"
-    )
-    userinfo = "0" if used is None else f"upload=0; download={used}; total={quota}; expire=0"
+    lines = [f"Ник · {nick}", f"Скачано · {traffic}"]
+    if uploaded is not None:
+        lines.append(f"Отправлено · {number(uploaded / GIB)} ГиБ")
+    lines.extend((f"Квота скачивания · {quota_label}", f"Скорость · {speed_label}"))
+    notice = "\n".join(lines)
+    if uploaded is None:
+        userinfo = "0" if used is None else f"upload=0; download={used}; total={quota}; expire=0"
+    else:
+        # Clients add both directions. The download-only quota is in the announcement.
+        userinfo = f"upload={uploaded}; download={used or 0}; total=0; expire=0"
     return (
         ("profile-title", "base64:" + base64.b64encode(title.encode()).decode("ascii")),
         ("announce", "base64:" + base64.b64encode(notice[:200].encode()).decode("ascii")),
         ("subscription-userinfo", userinfo),
-        ("profile-update-interval", "12"),
+        ("profile-update-interval", "1"),
     )
 
 
@@ -185,6 +214,26 @@ def decoded_profiles(data):
 
 def direct_profile(data):
     return urlsplit(next(line for line in decoded_profiles(data) if line.startswith("vless://")))
+
+
+def relay_address():
+    try:
+        return IPv4Address(RU_RELAY.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def ru_split_document(profile, relay):
+    if split_profile is None or relay is None:
+        raise ValueError("Сплит RU → NL выключен")
+    for link in decoded_profiles(profile.strip()):
+        url = urlsplit(link)
+        if url.scheme != "vless" or (url.port or 443) != 443:
+            continue
+        params = parse_qs(url.query)
+        if params.get("type") in (["xhttp"], ["splithttp"]) and params.get("security") == ["reality"]:
+            return split_profile(link, relay, 443)
+    raise ValueError("Нужен прямой профиль XHTTP + REALITY на порту 443")
 
 
 def transport_links(user, settings):
@@ -274,7 +323,20 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.answer(404, b"Not found", "text/plain")
             return
-        used, quota, rate = counters(nick)
+        used, uploaded, quota, rate = counters(nick)
+        formats = parse_qs(location.query, keep_blank_values=True).get("format", [])
+        if "ru-nl" in formats:
+            if split or formats != ["ru-nl"]:
+                self.answer(404, b"Not found", "text/plain")
+                return
+            try:
+                document = ru_split_document(profile, relay_address())
+            except (ValueError, TypeError):
+                self.answer(404, b"Profile not found", "text/plain")
+                return
+            self.answer(200, json.dumps(document, ensure_ascii=False).encode(), "application/json",
+                        app_metadata(nick, used, quota, rate, uploaded=uploaded, ru_split=True))
+            return
         settings = json.loads(TRANSPORTS.read_text()) if TRANSPORTS.is_file() and not split else {}
         if location.query == "format=hysteria":
             if not settings:
@@ -293,15 +355,22 @@ class Handler(BaseHTTPRequestHandler):
         accept_html = "text/html" in self.headers.get("Accept", "")
         navigation = self.headers.get("Sec-Fetch-Mode", "") in ("", "navigate")
         if not manually and not app_request and accept_html and navigation:
-            self.answer(200, card(nick, used, quota, rate, location.path, bool(settings)),
-                        "text/html; charset=utf-8")
+            has_ru_split = False
+            if not split and (relay := relay_address()) is not None:
+                try:
+                    ru_split_document(profile, relay)
+                    has_ru_split = True
+                except (ValueError, TypeError):
+                    pass
+            self.answer(200, card(nick, used, quota, rate, location.path, bool(settings),
+                                  uploaded=uploaded, has_ru_split=has_ru_split), "text/html; charset=utf-8")
             return
         try:
             profile = branded_profile(profile, split, settings)
         except (ValueError, TypeError, KeyError, StopIteration, UnicodeError, binascii.Error):
             # Keep nonstandard legacy profiles importable.
             pass
-        metadata = app_metadata(nick, used, quota, rate)
+        metadata = app_metadata(nick, used, quota, rate, uploaded=uploaded)
         if app_request and not split:
             try:
                 links = decoded_profiles(profile.strip())
@@ -568,6 +637,23 @@ def serve():
         server.serve_forever()
 
 
+def install_ru_split(address):
+    if split_profile is None:
+        raise ValueError("Установи модуль /usr/local/sbin/lastvn_aeza_split.py")
+    relay = IPv4Address(address)
+    previous = RU_RELAY.read_text() if RU_RELAY.exists() else None
+    write(RU_RELAY, f"{relay}\n", 0o600)
+    try:
+        install()
+    except BaseException:
+        if previous is None:
+            RU_RELAY.unlink(missing_ok=True)
+        else:
+            write(RU_RELAY, previous, 0o600)
+        raise
+    print("Подписка RU → NL доступна с параметром ?format=ru-nl.")
+
+
 SERVICE = "lastvn-subscription.service"
 
 
@@ -581,7 +667,11 @@ if __name__ == "__main__":
             with open("/run/lock/lastos-admin.lock", "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 actions[args[0]]()
+        elif len(args) == 2 and args[0] == "install-ru-split" and os.geteuid() == 0:
+            with open("/run/lock/lastos-admin.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                install_ru_split(args[1])
         else:
-            sys.exit("Установка: lastos-subscriptions install | transports (от root)")
+            sys.exit("Установка: lastos-subscriptions install | transports | install-ru-split IPv4_RU (от root)")
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(f"Ошибка подписок LastVN: {error}")

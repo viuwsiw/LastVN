@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -28,6 +29,7 @@ PREFIX = "lastos-limit-"
 GATEWAY_PORT = 16099
 PORT_BASE = 16100
 NICK = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+UPLOAD_SCHEMA = "CREATE TABLE IF NOT EXISTS usage_upload (nick TEXT PRIMARY KEY, bytes INTEGER NOT NULL)"
 
 
 def run(*args):
@@ -354,7 +356,27 @@ def forget_deleted(name):
                     run("systemctl", "disable", "--now", SERVICE)
     if DB.exists() and (not LIVE.exists() or name not in limits):
         with open_db(DB) as db:
+            db.execute(UPLOAD_SCHEMA)
             db.execute("DELETE FROM usage WHERE nick = ?", (name,))
+            db.execute("DELETE FROM usage_upload WHERE nick = ?", (name,))
+
+
+def flush_usage(db, meters):
+    pending = [meter for meter in meters
+               if (meter.used, meter.uploaded) != (meter.saved, meter.saved_uploaded)]
+    if not pending:
+        return
+    with db:
+        db.executemany(
+            "INSERT INTO usage (nick, bytes) VALUES (?, ?) ON CONFLICT(nick) DO UPDATE SET bytes=excluded.bytes",
+            [(meter.name, meter.used) for meter in pending],
+        )
+        db.executemany(
+            "INSERT INTO usage_upload (nick, bytes) VALUES (?, ?) ON CONFLICT(nick) DO UPDATE SET bytes=excluded.bytes",
+            [(meter.name, meter.uploaded) for meter in pending],
+        )
+    for meter in pending:
+        meter.saved, meter.saved_uploaded = meter.used, meter.uploaded
 
 
 class Meter:
@@ -365,7 +387,9 @@ class Meter:
         self.db = db
         row = db.execute("SELECT bytes FROM usage WHERE nick = ?", (name,)).fetchone()
         self.used = row[0] if row else 0
-        self.saved = self.used
+        row = db.execute("SELECT bytes FROM usage_upload WHERE nick = ?", (name,)).fetchone()
+        self.uploaded = row[0] if row else 0
+        self.saved, self.saved_uploaded = self.used, self.uploaded
         self.lock = asyncio.Lock()
         self.apply(settings)
 
@@ -378,18 +402,10 @@ class Meter:
             for task in self.connections:
                 task.cancel()
         if settings.get("reset_usage"):
-            self.used = self.saved = 0
-            self.db.execute("DELETE FROM usage WHERE nick = ?", (self.name,))
-            self.db.commit()
-
-    def flush(self):
-        if self.used != self.saved:
-            self.db.execute(
-                "INSERT INTO usage VALUES (?, ?) ON CONFLICT(nick) DO UPDATE SET bytes=excluded.bytes",
-                (self.name, self.used),
-            )
-            self.db.commit()
-            self.saved = self.used
+            with self.db:
+                self.db.execute("DELETE FROM usage WHERE nick = ?", (self.name,))
+                self.db.execute("DELETE FROM usage_upload WHERE nick = ?", (self.name,))
+            self.used = self.saved = self.uploaded = self.saved_uploaded = 0
 
     async def download(self, reader, writer):
         while True:
@@ -414,7 +430,7 @@ class Meter:
                 chunk = allowed
                 self.used += len(chunk)
                 if self.quota or self.used - self.saved >= 1024**2:
-                    self.flush()
+                    flush_usage(self.db, (self,))
                 writer.write(chunk)
             await writer.drain()
             if self.quota and self.used >= self.quota:
@@ -431,7 +447,7 @@ class Meter:
             remote_reader, remote_writer = await asyncio.open_connection("127.0.0.1", GATEWAY_PORT)
             tasks = [
                 asyncio.create_task(self.download(remote_reader, writer)),
-                asyncio.create_task(copy_upload(reader, remote_writer)),
+                asyncio.create_task(self.upload(reader, remote_writer)),
             ]
             # A client may finish sending before the remote finishes replying.
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -449,14 +465,14 @@ class Meter:
                 if stream:
                     stream.close()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self.flush()
+            flush_usage(self.db, (self,))
 
-
-async def copy_upload(reader, writer):
-    while chunk := await reader.read(65536):
-        writer.write(chunk)
-        await writer.drain()
-    writer.write_eof()
+    async def upload(self, reader, writer):
+        while chunk := await reader.read(65536):
+            writer.write(chunk)
+            self.uploaded += len(chunk)
+            await writer.drain()
+        writer.write_eof()
 
 
 async def serve():
@@ -468,6 +484,7 @@ async def serve():
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("CREATE TABLE IF NOT EXISTS usage (nick TEXT PRIMARY KEY, bytes INTEGER NOT NULL)")
+        db.execute(UPLOAD_SCHEMA)
         gateway = await asyncio.create_subprocess_exec(XRAY, "run", "-c", str(folder / "egress.json"))
         listeners = {}
 
@@ -509,22 +526,49 @@ async def serve():
 
         lock = asyncio.Lock()
         server = None
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, stop.set)
+        watchers = []
+
+        async def persist():
+            while True:
+                await asyncio.sleep(1)
+                flush_usage(db, (meter for _, meter, _ in listeners.values()))
+
         try:
             await reconcile(limits)
             control_path.unlink(missing_ok=True)
             server = await asyncio.start_unix_server(control, str(control_path), limit=200000)
-            status = await gateway.wait()
-            raise RuntimeError(f"Внутренний Xray завершился с кодом {status}")
+            gateway_exit = asyncio.create_task(gateway.wait())
+            traffic = asyncio.create_task(persist())
+            stopping = asyncio.create_task(stop.wait())
+            watchers = [gateway_exit, traffic, stopping]
+            done, _ = await asyncio.wait(watchers, return_when=asyncio.FIRST_COMPLETED)
+            if stopping not in done:
+                if traffic in done:
+                    traffic.result()
+                raise RuntimeError(f"Внутренний Xray завершился с кодом {gateway_exit.result()}")
         finally:
+            for task in watchers:
+                task.cancel()
             if server:
                 server.close()
-                await server.wait_closed()
             for listener, _, _ in listeners.values():
                 listener.close()
-                await listener.wait_closed()
+            connections = {task for _, meter, _ in listeners.values() for task in meter.connections}
+            for task in connections:
+                task.cancel()
             if gateway.returncode is None:
                 gateway.terminate()
                 await gateway.wait()
+            await asyncio.gather(*watchers, *connections, return_exceptions=True)
+            if server:
+                await server.wait_closed()
+            for listener, _, _ in listeners.values():
+                await listener.wait_closed()
+            flush_usage(db, (meter for _, meter, _ in listeners.values()))
+            loop.remove_signal_handler(signal.SIGTERM)
 
 
 def main():
