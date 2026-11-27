@@ -72,10 +72,11 @@ Wants=network-online.target
 
 [Service]
 DynamicUser=yes
+LoadCredential=relay.json:/usr/local/etc/xray/lastvn-ru-relay.json
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
-ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/lastvn-ru-relay.json
+ExecStart=/usr/local/bin/xray run -c %d/relay.json
 Restart=on-failure
 RestartSec=2
 
@@ -83,9 +84,12 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
-install -Dm 644 "$work/relay.json" "$config_path"
+install -Dm 600 "$work/relay.json" "$config_path"
 install -m 644 "$work/$unit" "$unit_path"
 systemctl daemon-reload
+if systemctl is-failed --quiet "$unit"; then
+  systemctl reset-failed "$unit"
+fi
 systemctl restart "$unit"
 
 for _ in {1..20}; do
